@@ -1,0 +1,64 @@
+{
+  "device": {
+    "id": "",
+    "name": "My E-Paper Display",
+    "display_variant": "YOUR_PLATFORMIO_ENV_NAME",
+    "_comment": "id: Leave empty to auto-generate from hardware MAC address (recommended). Set manually only for custom identifiers. name: Human-readable device name for WiFi hostname. A unique 4-character hash (derived from device.id) is automatically appended to prevent conflicts. Example: 'My E-Paper Display' becomes 'my-e-paper-display-a1b2'. display_variant REQUIRED for OTA updates. Must match your compiled firmware environment. Valid values: lilygo_t5_depg_bw (BW default), lilygo_t5_gdew_bw (BW), lilygo_t5_gdem_4g (4G grayscale), lilygo_t5_gdew_4g (4G grayscale), lilygo_t5_gdey_4g (4G fast), lilygo_t5_v231 (legacy BW), lilygo_t5_213 (legacy BW), lilygo_t5s_27 (legacy 2.7\" BW). See platformio.ini [env:xxx] sections."
+  },
+  "wifi": {
+    "timeout_ms": 20000,
+    "force_high_power": false,
+    "escalation_threshold": 3,
+    "max_failed_wakes": 20,
+    "seed_networks": [
+      {"ssid": "Home_WiFi", "password": "your_home_password"},
+      {"ssid": "Office_WiFi", "password": "your_office_password"}
+    ],
+    "_comment": "TX power: By default (false), uses adaptive mode starting at LOW (11dBm) for ~40% WiFi battery savings, auto-escalating to MEDIUM/HIGH if connection fails. Set true to always use HIGH (19.5dBm). After 20 failed wakes, enters low-power fallback mode (60min sleep, retries every 6h). seed_networks: Pre-configured WiFi networks that are pinned (never evicted by LRU). Device stores up to 5 networks total. Remove seed_networks array if you want provisioning-only mode."
+  },
+  "server": {
+    "host": "YOUR_SERVER_URL",
+    "port": 443,
+    "path": "/ws-stream",
+    "use_ssl": true,
+    "reconnect_jitter_max_sec": 0,
+    "_comment_jitter": "reconnect_jitter_max_sec: 0 = disabled (set to 30 for fleet deployments of 50-100, 60 for 100+)"
+  },
+  "display": {
+    "rotation": 1
+  },
+  "security": {
+    "auth_token": "",
+    "encryption": "ecdh",
+    "_comment": "auth_token: Leave empty for self-service pairing (device displays a code to enter in Slack). Or set manually from admin panel for pre-provisioned devices. encryption: 'ecdh' (default, auto key generation) or 'none'. ECDH P-256 keys auto-generated on first boot and stored in NVS."
+  },
+  "power": {
+    "sleep_enabled": true,
+    "sleep_duration_min": 1
+  },
+  "logging": {
+    "default_level": "WARN",
+    "enable_test_commands": false
+  },
+  "timezone": {
+    "sync_interval_hours": 24,
+    "source": "server",
+    "ipgeolocation_api_key": "",
+    "update_server": true,
+    "_comment": "Timezone auto-detection. sync_interval_hours: 1-168 (default: 24, max: 1 week to limit RTC drift). source: 'server' (default, free, unlimited, uses server-side GeoIP) | 'ipgeolocation' (requires ipgeolocation_api_key from ipgeolocation.io, 1000 requests/day free tier). update_server: Set true to sync timezone to server (enables local time display like '19:15 EST' instead of '00:15 UTC'). Set false for privacy (server won't store your timezone). Only applies when source='server'."
+  },
+  "quiet_hours": {
+    "start_hour": 23,
+    "end_hour": 7,
+    "sleep_multiplier": 6,
+    "_comment": "Quiet hours extend sleep duration for battery savings. Weekdays: 11PM-7AM use 30-min sleep (1min x 6). Weekends: ALL DAY 30-min sleep for ~20% battery savings."
+  },
+  "display_policy": {
+    "skip_refresh_on_no_message": true,
+    "_comment": "skip_refresh_on_no_message saves battery by only refreshing when new reactions arrive or power state changes."
+  },
+  "ota": {
+    "enabled": true,
+    "_comment": "Set to false to disable automatic firmware updates. Useful for self-hosted servers or custom firmware builds."
+  }
+}

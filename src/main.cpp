@@ -1,0 +1,5665 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WiFiManager.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <qrcode.h>
+
+// Conditional display library includes based on build flags
+#ifdef DISPLAY_4G_GRAYSCALE
+    // 4-level grayscale library
+    #include <GxEPD2_4G_4G.h>
+    #include <gdey/GxEPD2_213_GDEY0213B74.h>  // 2.13" 4G (GDEY0213B74)
+    #include <epd/GxEPD2_213_flex.h>          // 2.13" 4G (GDEW0213I5F - flexible)
+#else
+    // 2-level black & white library
+    #include <GxEPD2_BW.h>
+    // Include headers for all supported BW displays
+    #include <epd/GxEPD2_213_B74.h>   // 2.13" BW (DEPG0213BN)
+    #include <epd/GxEPD2_213_T5D.h>   // 2.13" BW (GDEW0213T5D)
+    #include <epd/GxEPD2_270.h>       // 2.7" BW (GDEY027T91)
+#endif
+
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSans12pt7b.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansOblique9pt7b.h>
+#include "config/ConfigManager.h"
+#include "wifi/WiFiCredentialManager.h"
+#include "security/SecurityManager.h"
+#include "resilience/ResilienceManager.h"
+#include <mbedtls/base64.h>
+#include <esp_sleep.h>
+#include <driver/adc.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <HTTPClient.h>
+#include <PNGdec.h>
+#include <LittleFS.h>
+#include <time.h>      // For time_t, struct tm, gmtime(), strptime()
+#include <sys/time.h>  // For settimeofday(), gettimeofday()
+#include "ota/OTAManager.h"
+
+// ============================================================================
+// Power Management
+// ============================================================================
+RTC_DATA_ATTR int bootCount = 0;  // Persists across deep sleep
+RTC_DATA_ATTR unsigned long lastMessageTime = 0;
+
+// ============================================================================
+// Timezone Management (RTC memory persists across sleep)
+// ============================================================================
+RTC_DATA_ATTR time_t lastTimeSyncTimestamp = 0;     // Unix timestamp of last sync
+RTC_DATA_ATTR int timezoneOffsetSeconds = 0;        // Timezone offset in seconds (includes DST)
+RTC_DATA_ATTR time_t currentTime = 0;               // Current time (read from ESP32 RTC each wake)
+RTC_DATA_ATTR bool hasEverSynced = false;           // True if we've successfully synced at least once
+
+// ============================================================================
+// Debug Configuration
+// ============================================================================
+// #define ENABLE_DEBUG_FEATURES  // Uncomment for debugging/testing
+
+// ============================================================================
+// Connection Timing Constants
+// ============================================================================
+// These are hardcoded to match server protocol and prevent user misconfiguration
+namespace ConnectionTiming {
+    constexpr uint32_t HEARTBEAT_INTERVAL_MS = 15000;      // Expect heartbeat every 15s
+    constexpr uint32_t HEARTBEAT_TIMEOUT_MS = 30000;       // Consider connection dead after 30s
+    constexpr uint32_t WS_INITIAL_RECONNECT_MS = 15000;    // Wait 15s before first retry
+    constexpr uint32_t WS_MAX_RECONNECT_MS = 60000;        // Max 60s between retries (exponential backoff)
+}
+
+// ============================================================================
+// Log Levels and System
+// ============================================================================
+enum LogLevel {
+    LOG_ERROR = 0,
+    LOG_WARN = 1,
+    LOG_INFO = 2,
+    LOG_DEBUG = 3,
+    LOG_TEST = 4
+};
+
+LogLevel currentLogLevel = LOG_WARN;  // Production: WARN, Debug: INFO/DEBUG
+
+// Structured logging with AI-friendly format
+// Uses single Serial.println() for atomic output to prevent corruption from interrupts
+void logMessage(LogLevel level, const char* module, const char* message, const char* kvPairs = nullptr) {
+    if (level > currentLogLevel) return;
+
+    const char* levelStr[] = {"ERROR", "WARN", "INFO", "DEBUG", "TEST"};
+
+    // Pre-format entire log message into buffer for atomic output
+    // This prevents UART corruption when interrupts (ADC, SPI, WiFi) fire mid-transmission
+    char logBuf[256];
+
+    if (kvPairs) {
+        snprintf(logBuf, sizeof(logBuf), "[%lu][%s][%s] %s | %s",
+                millis(), levelStr[level], module, message, kvPairs);
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "[%lu][%s][%s] %s",
+                millis(), levelStr[level], module, message);
+    }
+
+    // Single atomic write prevents corruption from concurrent interrupts
+    Serial.println(logBuf);
+
+    // Flush output buffer to ensure transmission completes before potential interrupt
+    Serial.flush();
+}
+
+// Overload for ConfigManager compatibility
+void logMessage(int level, const char* module, const char* message, const char* kvPairs = nullptr) {
+    logMessage(static_cast<LogLevel>(level), module, message, kvPairs);
+}
+
+// ============================================================================
+// Configuration - Now loaded from LittleFS via ConfigManager
+// ============================================================================
+// Display text limits (keeping as constexpr since they're compile-time UI constants)
+namespace DisplayLimits {
+    constexpr size_t MAX_USER_LENGTH = 15;
+    constexpr size_t MAX_CHANNEL_LENGTH = 15;
+    constexpr size_t MAX_MESSAGE_LENGTH = 30;
+
+    // Emoji position: leaves space for lock icon (top-left) and battery indicator (top-right)
+    constexpr int16_t EMOJI_X = 10;  // 10px from left
+    constexpr int16_t EMOJI_Y = 32;  // 32px from top (optimized for balanced layout)
+}
+
+// ============================================================================
+// Battery Management Constants
+// ============================================================================
+namespace BatteryConstants {
+    // No-battery detection thresholds
+    constexpr int NO_BATTERY_VARIANCE_THRESHOLD = 500;     // Max ADC variance for valid battery
+    constexpr int NO_BATTERY_MIN_ADC = 100;                // Min ADC reading (below = disconnected)
+    constexpr int NO_BATTERY_MAX_ADC = 4000;               // Max ADC reading (above = floating)
+    constexpr float NO_BATTERY_MIN_VOLTAGE = 2.5f;         // Min voltage for valid LiPo
+    constexpr float NO_BATTERY_MAX_VOLTAGE = 5.5f;         // Max voltage (allows for USB 5V)
+
+    // USB detection thresholds (MakerFocus 3.7V 2000mAh LiPo with TP4054 charger)
+    // Hysteresis prevents oscillation: different thresholds for each direction
+    constexpr float USB_HIGH_VOLTAGE_THRESHOLD = 4.05f;    // Battery→USB: Detect while charging (87%+)
+    constexpr float USB_TO_BATTERY_THRESHOLD = 4.15f;      // USB→Battery: Require drop to 4.15V
+    constexpr float VOLTAGE_STABILITY_THRESHOLD = 0.005f;  // Increased from 0.002V² to account for ADC noise during WiFi (√0.005 = 71mV p-p tolerance)
+
+    // LiPo voltage range (MakerFocus specs + Adafruit data)
+    constexpr float LIPO_MAX_VOLTAGE = 4.2f;               // Fully charged
+    constexpr float LIPO_NOMINAL_VOLTAGE = 3.7f;           // Nominal (~50% capacity)
+    constexpr float LIPO_DEAD_VOLTAGE = 3.4f;              // "Dead" battery per Adafruit
+    constexpr float LIPO_CUTOFF_VOLTAGE = 3.0f;            // Protection board cutoff
+
+    // Sleep thresholds
+    constexpr int LOW_BATTERY_SLEEP_THRESHOLD = 15;        // Sleep immediately below 15% (balanced runtime vs longevity)
+    constexpr int LOW_BATTERY_RECOVERY_THRESHOLD = 20;     // Must reach 20% before exiting critical state (prevents oscillation at threshold)
+    constexpr unsigned long GRACE_PERIOD_MS = 60000;       // 60s grace after switching to battery
+    constexpr unsigned long MAX_BATTERY_RUNTIME_MS = 30000; // 30sec max runtime on battery (~16s listening after connection overhead)
+
+    // ADC configuration
+    constexpr int ADC_SAMPLE_COUNT = 20;                   // Samples for averaging (increased from 10 for WiFi noise rejection)
+    constexpr int ADC_SAMPLE_DELAY_MS = 10;                // Delay between samples (increased from 5ms for noise settling)
+    constexpr float ADC_VOLTAGE_DIVIDER = 2.0f;            // 2:1 voltage divider
+    constexpr float ADC_MAX_VOLTAGE = 3.6f;                // ESP32 ADC max voltage
+    constexpr int ADC_RESOLUTION = 4095;                   // 12-bit ADC (0-4095)
+}
+
+// ============================================================================
+// Global Objects - Using proper initialization
+// ============================================================================
+namespace {  // Anonymous namespace for internal linkage
+    // Display instance - will be initialized after config is loaded
+    // Type determined by DISPLAY_WIDTH, DISPLAY_HEIGHT, and DISPLAY_4G_GRAYSCALE build flags
+    //
+    // Display Type Selection Matrix:
+    // - 212px + DISPLAY_4G_GRAYSCALE + DISPLAY_GDEW0213I5F -> 2.13" flexible 4-level (GxEPD2_213_flex)
+    // - 212px + DISPLAY_4G_GRAYSCALE                       -> 2.13" 4-level (GxEPD2_213_GDEY0213B74)
+    // - 264px                                              -> 2.7" BW (GxEPD2_270)
+    // - 212px + DISPLAY_GDEW0213T5D                        -> 2.13" BW UC8151D (GxEPD2_213_T5D)
+    // - 212px (default)                                    -> 2.13" BW (GxEPD2_213_B74)
+    //
+    #ifdef DISPLAY_4G_GRAYSCALE
+        #if defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 212
+            #ifdef DISPLAY_GDEW0213I5F
+                GxEPD2_4G_4G<GxEPD2_213_flex, GxEPD2_213_flex::HEIGHT>* display = nullptr;
+            #else
+                GxEPD2_4G_4G<GxEPD2_213_GDEY0213B74, GxEPD2_213_GDEY0213B74::HEIGHT>* display = nullptr;
+            #endif
+        #endif
+    #else
+        #if defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 264
+            GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT>* display = nullptr;
+        #elif defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 212
+            #ifdef DISPLAY_GDEW0213T5D
+                GxEPD2_BW<GxEPD2_213_T5D, GxEPD2_213_T5D::HEIGHT>* display = nullptr;
+            #else
+                GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>* display = nullptr;
+            #endif
+        #else
+            // Default to 2.13" if dimensions not specified
+            GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>* display = nullptr;
+        #endif
+    #endif
+
+    // WebSocket client
+    WebSocketsClient webSocket;
+
+    // WiFiMulti for multi-network support (iPhone-like behavior)
+    WiFiMulti wifiMulti;
+
+    // Connection state - volatile for ISR safety
+    // wsConnected: transport-level WebSocket connection is up
+    // wsRegistered: server confirmed authentication (two-phase handshake complete)
+    volatile bool wsConnected = false;
+    volatile bool wsRegistered = false;
+
+    // Timing variables
+    uint32_t lastHeartbeat = 0;
+    uint32_t lastReconnect = 0;
+    uint32_t reconnectDelay = 5000; // Will be updated from config
+    uint32_t lastWiFiReconnect = 0;
+
+    // Registration error retry tracking (resets on boot/wake, NOT persisted in RTC)
+    uint8_t registrationErrorCount = 0;
+    const uint8_t MAX_REGISTRATION_RETRIES = 3;
+    bool registrationFailedPermanently = false;  // Stop reconnecting after max retries
+
+    // DEVICE_NOT_LINKED retry tracking — prevents infinite pairing loop on battery.
+    // After MAX attempts, show help screen and deep sleep to let user intervene manually.
+    uint8_t deviceNotLinkedCount = 0;
+    const uint8_t MAX_DEVICE_NOT_LINKED_ATTEMPTS = 2;
+
+    // Connection metrics
+    struct ConnectionMetrics {
+        uint32_t startTime = 0;
+        uint32_t totalConnections = 0;
+        uint32_t failedConnections = 0;
+        uint32_t messagesReceived = 0;
+        uint32_t heartbeatsReceived = 0;
+    } metrics;
+
+    #ifdef ENABLE_DEBUG_FEATURES
+    // Serial command buffer
+    String commandBuffer = "";
+    #endif
+}
+
+// ============================================================================
+// RTC Memory - Survives Deep Sleep
+// ============================================================================
+// Store last display content in RTC memory so we can redraw it after deep sleep.
+// Uses a discriminated union so any content type (reaction, broadcast, future types)
+// can be persisted and restored via restoreLastDisplay().
+enum DisplayContentType : uint8_t {
+    DISPLAY_CONTENT_NONE = 0,
+    DISPLAY_CONTENT_REACTION = 1,
+    DISPLAY_CONTENT_BROADCAST = 2,
+};
+
+RTC_DATA_ATTR struct {
+    DisplayContentType contentType = DISPLAY_CONTENT_NONE;
+    union {
+        struct {
+            char emoji[32];
+            char emojiUrl[128];
+            char user[64];
+            char channel[64];
+            char message[128];
+            char platform[16];
+            bool isEncrypted;
+        } reaction;
+        struct {
+            char source[64];
+            char message[256];
+            char platform[16];
+            char channel[64];
+            bool encrypted;
+        } broadcast;
+    };
+} lastDisplay;
+
+/** Save reaction data to RTC memory for persistence across deep sleep */
+static void saveReactionToRTC(const char* emoji, const char* emojiUrl, const char* user,
+                               const char* channel, const char* message, const char* platform,
+                               bool isEncrypted) {
+    lastDisplay.contentType = DISPLAY_CONTENT_REACTION;
+    strncpy(lastDisplay.reaction.emoji, emoji, sizeof(lastDisplay.reaction.emoji) - 1);
+    lastDisplay.reaction.emoji[sizeof(lastDisplay.reaction.emoji) - 1] = '\0';
+    strncpy(lastDisplay.reaction.emojiUrl, emojiUrl, sizeof(lastDisplay.reaction.emojiUrl) - 1);
+    lastDisplay.reaction.emojiUrl[sizeof(lastDisplay.reaction.emojiUrl) - 1] = '\0';
+    strncpy(lastDisplay.reaction.user, user, sizeof(lastDisplay.reaction.user) - 1);
+    lastDisplay.reaction.user[sizeof(lastDisplay.reaction.user) - 1] = '\0';
+    strncpy(lastDisplay.reaction.channel, channel, sizeof(lastDisplay.reaction.channel) - 1);
+    lastDisplay.reaction.channel[sizeof(lastDisplay.reaction.channel) - 1] = '\0';
+    strncpy(lastDisplay.reaction.message, message, sizeof(lastDisplay.reaction.message) - 1);
+    lastDisplay.reaction.message[sizeof(lastDisplay.reaction.message) - 1] = '\0';
+    strncpy(lastDisplay.reaction.platform, platform, sizeof(lastDisplay.reaction.platform) - 1);
+    lastDisplay.reaction.platform[sizeof(lastDisplay.reaction.platform) - 1] = '\0';
+    lastDisplay.reaction.isEncrypted = isEncrypted;
+}
+
+/** Save broadcast data to RTC memory for persistence across deep sleep */
+static void saveBroadcastToRTC(const char* source, const char* message, const char* platform,
+                                const char* channel, bool encrypted) {
+    lastDisplay.contentType = DISPLAY_CONTENT_BROADCAST;
+    strncpy(lastDisplay.broadcast.source, source, sizeof(lastDisplay.broadcast.source) - 1);
+    lastDisplay.broadcast.source[sizeof(lastDisplay.broadcast.source) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.message, message, sizeof(lastDisplay.broadcast.message) - 1);
+    lastDisplay.broadcast.message[sizeof(lastDisplay.broadcast.message) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.platform, platform, sizeof(lastDisplay.broadcast.platform) - 1);
+    lastDisplay.broadcast.platform[sizeof(lastDisplay.broadcast.platform) - 1] = '\0';
+    strncpy(lastDisplay.broadcast.channel, channel, sizeof(lastDisplay.broadcast.channel) - 1);
+    lastDisplay.broadcast.channel[sizeof(lastDisplay.broadcast.channel) - 1] = '\0';
+    lastDisplay.broadcast.encrypted = encrypted;
+}
+
+// Track what the display is showing (survives deep sleep)
+RTC_DATA_ATTR bool displayShowingConnectionLost = false;
+RTC_DATA_ATTR bool displayShowingBattery = false;
+RTC_DATA_ATTR bool hasShownBlankScreen = false;  // Track if we've shown blank screen at least once
+RTC_DATA_ATTR bool hasShownLowBatteryWarning = false;  // Track if low battery warning was shown (resets on USB)
+
+// Track if device woke from sleep on battery (survives deep sleep)
+// Used to differentiate between two battery scenarios with different timeout behaviors:
+// - Wake on battery: Device was already unplugged before sleep (use 45s timeout for efficiency)
+// - USB unplugged: Transitioned from USB→battery while awake (use 60s grace period for stability)
+RTC_DATA_ATTR bool wokeOnBattery = false;
+
+// ADC calibration handle for accurate battery voltage readings
+// Uses factory-burned eFuse calibration data to correct ESP32 ADC non-linearity
+adc_cali_handle_t adc_cali_handle = nullptr;
+
+// Power management state (survives deep sleep)
+RTC_DATA_ATTR unsigned long rtcBatteryModeStartTime = 0;
+RTC_DATA_ATTR bool rtcWasPreviouslyOnBattery = false;
+
+// USB detection state (survives deep sleep for accurate delta detection)
+RTC_DATA_ATTR float rtcLastVoltage = 0.0f;        // Last measured voltage for delta calculation
+RTC_DATA_ATTR bool rtcLastUSBState = false;       // Last known USB power state
+
+// WiFi adaptive power management state (survives deep sleep)
+RTC_DATA_ATTR struct {
+    wifi_power_t currentPower;       // Current TX power level
+    uint8_t consecutiveFailures;     // Consecutive failures at current level
+    uint8_t totalFailedWakes;        // Total failed wake cycles
+    bool wifiDisabledMode;           // True if in low-power fallback
+    uint8_t fallbackWakeCount;       // Wakes since entering fallback
+} wifiPowerState = {
+    WIFI_POWER_11dBm,  // Start at LOW for battery savings
+    0,
+    0,
+    false,
+    0
+};
+
+// ============================================================================
+// Display State Tracking
+// ============================================================================
+// Track whether a full refresh has happened since wake (reset on each wake)
+bool fullRefreshSinceWake = false;
+
+// ============================================================================
+// OTA Update State
+// ============================================================================
+OTAManager* otaManager = nullptr;  // Initialized in setup() after config loaded
+bool pendingUpdate = false;
+String pendingVersion = "";
+unsigned long lastReactionTime = 0;  // Track when last reaction displayed
+unsigned long lastOTACheckMillis = 0;  // millis() when last OTA check performed (NOT RTC - resets on boot)
+
+// Forward declarations
+void handleWebSocketMessage(const uint8_t* payload, size_t length);
+void gracefulShutdown(const char* reason, bool clearDisplay);
+int getBatteryPercentage();
+int getBatteryLevel();
+bool isUSBPowered();
+void injectTestMessage(const String& jsonPayload);
+void checkForFirmwareUpdate();
+void performOTAUpdate();
+bool isDeviceIdle();
+void enterDeepSleep(uint32_t sleep_minutes);
+void enterPairingMode();
+void handleButtonHold(bool needsInit);
+static bool restoreLastDisplay();
+
+// ============================================================================
+// Display State Helper
+// ============================================================================
+// Helper function to update display state after any full refresh
+void updateDisplayStateAfterFullRefresh() {
+    fullRefreshSinceWake = true;
+    displayShowingBattery = !isUSBPowered();
+
+    char stateBuf[64];
+    snprintf(stateBuf, sizeof(stateBuf), "fullRefresh=true displayShowingBattery=%s",
+             displayShowingBattery ? "true" : "false");
+    logMessage(LOG_DEBUG, "DISPLAY", "Display state updated after full refresh", stateBuf);
+}
+
+// ============================================================================
+// Emoji Renderer - Memory-efficient PNG emoji rendering
+// ============================================================================
+class EmojiRenderer {
+private:
+    // Memory and size constraints
+    static constexpr size_t MIN_HEAP_FOR_RENDER = 20000;  // 20KB minimum free heap
+    static constexpr size_t MAX_EMOJI_SIZE = 128000;      // 128KB maximum (Slack's limit)
+    static constexpr int LEAK_TOLERANCE_BYTES = 2500;     // HTTPS + heap fragmentation tolerance
+
+    static PNG png;
+    static uint8_t* downloadBuffer;
+    static size_t downloadSize;
+    static size_t downloadCapacity;
+    static int16_t renderX, renderY;
+
+    // PNG decoder callback - called once per line of decoded image
+    // pDraw->pPixels contains ONE LINE of pixels (not the full image)
+    static int pngDraw(PNGDRAW *pDraw) {
+        // Safety checks
+        if (!display || !pDraw || !pDraw->pPixels) return 1;
+
+        // Determine bytes per pixel based on PNG type
+        // Type 0=grayscale, 2=RGB, 3=palette, 4=grayscale+alpha, 6=RGBA
+        int bytesPerPixel = 1;
+        switch (pDraw->iPixelType) {
+            case 0: bytesPerPixel = 1; break;  // Grayscale
+            case 2: bytesPerPixel = 3; break;  // RGB
+            case 3: bytesPerPixel = 1; break;  // Palette (index)
+            case 4: bytesPerPixel = 2; break;  // Grayscale+Alpha
+            case 6: bytesPerPixel = 4; break;  // RGBA
+            default:
+                char logBuf[64];
+                snprintf(logBuf, sizeof(logBuf), "type=%d", pDraw->iPixelType);
+                logMessage(LOG_ERROR, "EMOJI", "Unknown PNG type", logBuf);
+                return 1;  // Don't process unknown formats
+        }
+
+        // Loop through pixels in this line only
+        for (int x = 0; x < pDraw->iWidth; x++) {
+            uint8_t r, g, b;
+            uint8_t* pPixel = pDraw->pPixels + (x * bytesPerPixel);
+
+            // Extract RGB based on PNG type
+            if (pDraw->iPixelType == 3 && pDraw->pPalette) {
+                // Palette - look up RGB from palette
+                uint8_t index = pPixel[0];
+                uint8_t* pal = pDraw->pPalette + (index * 3);
+                r = pal[0];
+                g = pal[1];
+                b = pal[2];
+            } else if (pDraw->iPixelType == 0 || (pDraw->iPixelType == 3 && !pDraw->pPalette)) {
+                // Grayscale
+                r = g = b = pPixel[0];
+            } else if (pDraw->iPixelType == 4) {
+                // Grayscale+Alpha
+                r = g = b = pPixel[0];
+            } else if (pDraw->iPixelType == 6) {
+                // RGBA
+                r = pPixel[0];
+                g = pPixel[1];
+                b = pPixel[2];
+            } else {
+                // RGB or default
+                r = pPixel[0];
+                g = pPixel[1];
+                b = pPixel[2];
+            }
+
+            // Alpha-composite onto white background for types with alpha
+            if (pDraw->iPixelType == 6) {  // RGBA
+                uint8_t a = pPixel[3];
+                r = (uint8_t)((r * a + 255 * (255 - a)) / 255);
+                g = (uint8_t)((g * a + 255 * (255 - a)) / 255);
+                b = (uint8_t)((b * a + 255 * (255 - a)) / 255);
+            } else if (pDraw->iPixelType == 4) {  // Grayscale+Alpha
+                uint8_t a = pPixel[1];
+                r = g = b = (uint8_t)((r * a + 255 * (255 - a)) / 255);
+            }
+
+            // Convert to grayscale
+            uint16_t gray = ((uint16_t)r + (uint16_t)g + (uint16_t)b) / 3;
+
+            // Gamma correction (γ=2.0): darkens mid-tones so bright colors
+            // like yellow don't wash out into light gray on e-paper.
+            gray = (uint16_t)gray * gray / 255;
+
+            // Map grayscale to display color depth
+            #ifdef DISPLAY_4G_GRAYSCALE
+                // 4-level grayscale — thresholds tuned for gamma-corrected values
+                uint16_t color;
+                if (gray < 32) color = GxEPD_BLACK;
+                else if (gray < 96) color = GxEPD_DARKGREY;
+                else if (gray < 176) color = GxEPD_LIGHTGREY;
+                else color = GxEPD_WHITE;
+            #else
+                // 2-level black & white threshold
+                uint16_t color = (gray > 128) ? GxEPD_WHITE : GxEPD_BLACK;
+            #endif
+
+            // Draw pixel with boundary check
+            int16_t px = renderX + x;
+            int16_t py = renderY + pDraw->y;
+            if (px >= 0 && px < display->width() && py >= 0 && py < display->height()) {
+                display->drawPixel(px, py, color);
+            }
+        }
+        return 1;  // Continue decoding
+    }
+
+public:
+    static bool renderEmojiFromURL(const char* url, int16_t x, int16_t y) {
+        // Validate URL
+        if (!url || url[0] == '\0') {
+            logMessage(LOG_ERROR, "EMOJI", "Invalid URL (NULL or empty)");
+            return false;
+        }
+
+        // Safety check: ensure minimum free heap
+        size_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < MIN_HEAP_FOR_RENDER) {
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "heap=%zu min=%zu", freeHeap, MIN_HEAP_FOR_RENDER);
+            logMessage(LOG_WARN, "EMOJI", "Low memory, skipping emoji", logBuf);
+            return false;
+        }
+
+        // Server handles GIF→PNG conversion, client just downloads whatever URL provided
+        // Download PNG from URL
+        if (!downloadEmoji(url)) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to download emoji");
+            cleanup();
+            return false;
+        }
+
+        // Decode and render PNG
+        renderX = x;
+        renderY = y;
+
+        int rc = png.openRAM(downloadBuffer, downloadSize, pngDraw);
+        if (rc != PNG_SUCCESS) {
+            char logBuf[32];
+            snprintf(logBuf, sizeof(logBuf), "error=%d", rc);
+            logMessage(LOG_ERROR, "EMOJI", "PNG open failed", logBuf);
+            cleanup();
+            return false;
+        }
+
+        rc = png.decode(NULL, 0);
+        png.close();
+
+        if (rc != PNG_SUCCESS) {
+            char logBuf[32];
+            snprintf(logBuf, sizeof(logBuf), "error=%d", rc);
+            logMessage(LOG_ERROR, "EMOJI", "PNG decode failed", logBuf);
+            cleanup();
+            return false;
+        }
+
+        cleanup();
+        logMessage(LOG_DEBUG, "EMOJI", "Render complete");
+        return true;
+    }
+
+private:
+    static bool downloadEmoji(const char* url) {
+        // Log the URL being downloaded for debugging certificate issues
+        char urlBuf[128];
+        snprintf(urlBuf, sizeof(urlBuf), "url=%.120s", url);
+        logMessage(LOG_DEBUG, "EMOJI", "Downloading emoji", urlBuf);
+
+        // Allocate WiFiClientSecure on heap to avoid stack overflow
+        // SSL contexts consume ~5-6KB which exceeds default Arduino loop stack (8KB)
+        WiFiClientSecure* secureClient = new WiFiClientSecure();
+        if (!secureClient) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to allocate SSL client");
+            return false;
+        }
+
+        // Determine if URL is from Slack CDN or our server
+        bool isSlackCDN = (strstr(url, "slack-edge.com") != nullptr ||
+                          strstr(url, "slack.com") != nullptr);
+
+        if (isSlackCDN) {
+            // Configure HTTPS with Mozilla CA certificate bundle (covers all Slack CDN domains)
+            extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+            extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+            size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+            secureClient->setCACertBundle(rootca_crt_bundle_start, bundle_size);
+            logMessage(LOG_DEBUG, "EMOJI", "Using CA bundle for Slack CDN");
+        } else {
+            // WORKAROUND: Skip certificate validation for server domain (same as OTA/WebSocket)
+            // See docs/SSL_CERT_VALIDATION_ISSUE.md for details on ECDSA validation failure
+            //
+            // Security rationale:
+            // - Connection is still encrypted with TLS 1.3 (not plaintext)
+            // - Server validates emoji source from authenticated Slack CDN
+            // - Client validates PNG magic bytes after download (prevents malformed data)
+            // - Low-value data (emoji images) on trusted home network
+            //
+            // This matches the security model used for OTA updates and WebSocket connections.
+            secureClient->setInsecure();
+            logMessage(LOG_DEBUG, "EMOJI", "Skipping cert check (encrypted + validated, trusted network)");
+        }
+
+        // Allocate HTTPClient on heap to avoid stack overflow
+        HTTPClient* http = new HTTPClient();
+        if (!http) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to allocate HTTP client");
+            delete secureClient;
+            return false;
+        }
+
+        http->setConnectTimeout(5000);  // 5 second timeout
+        http->setTimeout(10000);         // 10 second total timeout
+        http->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+        if (!http->begin(*secureClient, url)) {
+            logMessage(LOG_ERROR, "EMOJI", "HTTPS begin failed");
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        int httpCode = http->GET();
+        if (httpCode != HTTP_CODE_OK) {
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
+            logMessage(LOG_ERROR, "EMOJI", "HTTP GET failed", logBuf);
+            http->end();
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        int len = http->getSize();
+        if (len <= 0 || len > MAX_EMOJI_SIZE) {
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "invalid_size=%d", len);
+            logMessage(LOG_ERROR, "EMOJI", "Invalid content size", logBuf);
+            http->end();
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        // Allocate buffer for download
+        downloadCapacity = len;
+        downloadBuffer = (uint8_t*)malloc(downloadCapacity);
+        if (!downloadBuffer) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to allocate download buffer");
+            http->end();
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        // Read response into buffer with timeout protection
+        WiFiClient* stream = http->getStreamPtr();
+        if (!stream) {
+            logMessage(LOG_ERROR, "EMOJI", "Failed to get stream pointer");
+            free(downloadBuffer);
+            downloadBuffer = nullptr;
+            http->end();
+            delete http;
+            delete secureClient;
+            return false;
+        }
+
+        downloadSize = 0;
+        unsigned long downloadStart = millis();
+
+        while (http->connected() && downloadSize < downloadCapacity) {
+            // Timeout check: 10 second maximum for download
+            if ((unsigned long)(millis() - downloadStart) > 10000) {
+                char logBuf[64];
+                snprintf(logBuf, sizeof(logBuf), "downloaded=%zu/%zu bytes", downloadSize, downloadCapacity);
+                logMessage(LOG_ERROR, "EMOJI", "Download timeout", logBuf);
+                free(downloadBuffer);
+                downloadBuffer = nullptr;
+                http->end();
+                delete http;
+                delete secureClient;
+                return false;  // Timeout = failed download
+            }
+
+            size_t available = stream->available();
+            if (available) {
+                size_t toRead = min(available, downloadCapacity - downloadSize);
+                size_t bytesRead = stream->readBytes(downloadBuffer + downloadSize, toRead);
+                downloadSize += bytesRead;
+            } else {
+                delay(1);
+            }
+        }
+
+        http->end();
+        delete http;
+        delete secureClient;
+
+        // Verify we got complete download
+        if (downloadSize != downloadCapacity) {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "expected=%zu got=%zu", downloadCapacity, downloadSize);
+            logMessage(LOG_ERROR, "EMOJI", "Incomplete download", logBuf);
+            free(downloadBuffer);
+            downloadBuffer = nullptr;
+            return false;  // Don't process incomplete data
+        }
+
+        // Validate PNG file format (magic bytes: 0x89 PNG \r \n 0x1a \n)
+        // Protects against malformed or malicious files from compromised CDN
+        if (downloadSize < 8 ||
+            downloadBuffer[0] != 0x89 || downloadBuffer[1] != 0x50 ||
+            downloadBuffer[2] != 0x4E || downloadBuffer[3] != 0x47 ||
+            downloadBuffer[4] != 0x0D || downloadBuffer[5] != 0x0A ||
+            downloadBuffer[6] != 0x1A || downloadBuffer[7] != 0x0A) {
+            logMessage(LOG_ERROR, "EMOJI", "Invalid PNG file (bad magic bytes)");
+            free(downloadBuffer);
+            downloadBuffer = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    static void cleanup() {
+        if (downloadBuffer) {
+            free(downloadBuffer);
+            downloadBuffer = nullptr;
+        }
+        downloadSize = 0;
+        downloadCapacity = 0;
+    }
+};
+
+// Static member initialization
+PNG EmojiRenderer::png;
+uint8_t* EmojiRenderer::downloadBuffer = nullptr;
+size_t EmojiRenderer::downloadSize = 0;
+size_t EmojiRenderer::downloadCapacity = 0;
+int16_t EmojiRenderer::renderX = 0;
+int16_t EmojiRenderer::renderY = 0;
+
+// ============================================================================
+// Lock Icon Bitmaps (XBM format - 20x20 pixels)
+// ============================================================================
+namespace LockIcons {
+    // Locked padlock icon (shackle rows 4-8, body rows 9-18)
+    constexpr int locked_width = 20;
+    constexpr int locked_height = 20;
+    const unsigned char locked_bits[] PROGMEM = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x3f,0x00,
+        0xe0,0x79,0x00,0x70,0xe0,0x00,0x70,0xe0,0x00,0x70,0xe0,0x00,0xf8,0xff,0x01,
+        0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,
+        0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0x00,0x00,0x00
+    };
+
+    // Unlocked padlock icon (shackle rows 4-8 open on right, body rows 9-18)
+    constexpr int unlocked_width = 20;
+    constexpr int unlocked_height = 20;
+    const unsigned char unlocked_bits[] PROGMEM = {
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x03,0x00,
+        0xe0,0xc1,0x01,0x70,0x80,0x03,0x70,0x00,0x07,0x70,0x00,0x0e,0xf8,0xff,0x01,
+        0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,
+        0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0xf8,0xff,0x01,0x00,0x00,0x00
+    };
+}
+
+// ============================================================================
+// Display Helper Class - Modern C++ encapsulation
+// ============================================================================
+class DisplayManager {
+public:
+    // Draw lock icon (locked) in top-left corner
+    static void drawLockIcon(int16_t x = 5, int16_t y = 5) {
+        if (!display) return;
+        display->drawXBitmap(x, y, LockIcons::locked_bits,
+                            LockIcons::locked_width, LockIcons::locked_height,
+                            GxEPD_BLACK);
+    }
+
+    // Draw unlock icon in top-left corner
+    static void drawUnlockIcon(int16_t x = 5, int16_t y = 5) {
+        if (!display) return;
+        display->drawXBitmap(x, y, LockIcons::unlocked_bits,
+                            LockIcons::unlocked_width, LockIcons::unlocked_height,
+                            GxEPD_BLACK);
+    }
+
+    // Draw battery indicator in top-right corner
+    static void drawPowerStatusIndicator() {
+        // Show battery status text in top center when on battery power
+        // Status varies by battery percentage: BATTERY / LOW BATT / CHARGE NOW
+
+        // OPTIMIZATION OPPORTUNITY: Currently calls getBatteryStatus() multiple times per display update
+        // (once here in drawPowerStatusIndicator, again in drawBatteryIndicator)
+        // Better approach: Call getBatteryStatus() once in showReaction(), pass struct to both functions
+        // Impact: Minor (~10ms savings on ESP32), but cleaner architecture
+
+        if (!isUSBPowered()) {
+            int batteryPercentage = getBatteryPercentage();
+
+            // Determine status text based on battery percentage
+            const char* statusText;
+            if (batteryPercentage < 5) {
+                statusText = "CHARGE NOW";  // Critical (<5%)
+            } else if (batteryPercentage < 10) {
+                statusText = "LOW BATT";    // Low (<10%)
+            } else if (batteryPercentage < 20) {
+                statusText = "LOW BATT";    // Warning (<20%)
+            } else {
+                statusText = "BATTERY";     // Normal (>=20%)
+            }
+
+            display->setFont(nullptr);  // Small font for status text
+            int16_t centerX = display->width() / 2;
+
+            // Calculate text width to center it
+            int16_t x1, y1;
+            uint16_t w, h;
+            display->getTextBounds(statusText, 0, 0, &x1, &y1, &w, &h);
+
+            display->setCursor(centerX - (w / 2), 8);  // Top center
+            display->print(statusText);
+
+            display->setFont(&FreeSans9pt7b);  // Restore font for caller
+        }
+        // If isUSBPowered() returns true (voltage >= usb_threshold_v from config), show nothing
+        // Could be USB or just freshly unplugged battery - we can't tell
+    }
+
+    static void drawBatteryIndicator() {
+        int batteryLevel = getBatteryLevel();
+
+        // Don't show indicator if no battery detected
+        if (batteryLevel < 0) return;
+
+        // Position for top-right corner
+        // Display is 250x122, so put circles at top-right
+        const int16_t circleRadius = 4;
+        const int16_t circleSpacing = 12;
+        const int16_t xStart = display->width() - 50;  // 50 pixels from right edge
+        const int16_t y = 10;  // 10 pixels from top
+
+        // Always draw 3 circles, fill them based on battery level
+        for (int i = 0; i < 3; i++) {
+            int16_t x = xStart + (i * circleSpacing);
+
+            if (i < batteryLevel) {
+                // Filled circle for charged portion
+                display->fillCircle(x, y, circleRadius, GxEPD_BLACK);
+            } else {
+                // Empty circle for discharged portion
+                display->drawCircle(x, y, circleRadius, GxEPD_BLACK);
+            }
+        }
+
+        // No charging indicator needed - "USB" text in top center shows charging status
+
+        // Optional: Show percentage text below circles for debugging
+        #ifdef ENABLE_DEBUG_FEATURES
+        int percentage = getBatteryPercentage();
+        if (percentage >= 0) {
+            display->setFont(nullptr);  // Use default small font
+            display->setCursor(xStart, y + 12);
+            display->print(percentage);
+            display->print("%");
+            display->setFont(&FreeSans9pt7b);  // Switch back to normal font
+        }
+        #endif
+    }
+
+    static void showMessage(const String& line1,
+                           const String& line2 = "",
+                           const String& line3 = "",
+                           const String& line4 = "",
+                           bool showLockIcon = false) {
+        char logBuf[128];
+        snprintf(logBuf, sizeof(logBuf), "lines=%d text=\"%s\"",
+                 (line1.isEmpty() ? 0 : 1) + (line2.isEmpty() ? 0 : 1) +
+                 (line3.isEmpty() ? 0 : 1) + (line4.isEmpty() ? 0 : 1),
+                 line1.c_str());
+        logMessage(LOG_DEBUG, "DISPLAY", "Showing message", logBuf);
+
+        if (!display) return; // Safety check
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+            display->setFont(&FreeSans9pt7b);
+
+            // Draw battery indicator and power status in top-right
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();  // Show "BATTERY" in top center when on battery
+
+            // Draw lock icon if encryption is enabled
+            if (showLockIcon) {
+                drawLockIcon();
+            }
+
+            constexpr int16_t x = 10;
+            constexpr int16_t yStart = 40;  // Moved down from 25 to 40
+            constexpr int16_t ySpacing = 20;
+
+            const String* lines[] = {&line1, &line2, &line3, &line4};
+
+            for (size_t i = 0; i < 4; ++i) {
+                if (!lines[i]->isEmpty()) {
+                    display->setCursor(x, yStart + (i * ySpacing));
+                    display->print(*lines[i]);
+                }
+            }
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    /**
+     * Display a broadcast alert — text-only, full display width.
+     * No emoji image, no channel. Source name in bold, message word-wrapped below.
+     */
+    /**
+     * Display a broadcast alert — structured card layout with header bar and message box.
+     * Layout:
+     *   +--------------------------------------------------+
+     *   | [lock]         BATTERY          [ooo]            |
+     *   | ████████████████████████████████████████████████ |
+     *   | █     #channel  ·  Announcement                █ |
+     *   | ████████████████████████████████████████████████ |
+     *   | ┌──────────────────────────────────────────────┐ |
+     *   | │           Source Name (bold)                 │ |
+     *   | │      Message line 1 (centered)              │ |
+     *   | │      Message line 2 (centered)              │ |
+     *   | └──────────────────────────────────────────────┘ |
+     *   | Platform                                        |
+     *   +--------------------------------------------------+
+     */
+    static void showBroadcast(const JsonObject& broadcast) {
+        const char* source = broadcast["user"] | "Alert";
+        const char* message = broadcast["message"] | "";
+        const char* platform = broadcast["platform"] | "";
+        const char* channel = broadcast["channel"] | "";
+        bool isEncrypted = broadcast["encrypted"] | false;
+
+        char logBuf[128];
+        snprintf(logBuf, sizeof(logBuf), "source=%s encrypted=%s",
+                 source, isEncrypted ? "true" : "false");
+        logMessage(LOG_INFO, "DISPLAY", "Showing broadcast", logBuf);
+
+        displayShowingConnectionLost = false;
+        saveBroadcastToRTC(source, message, platform, channel, isEncrypted);
+        logMessage(LOG_INFO, "RTC", "Saved broadcast to RTC memory for deep sleep recovery");
+
+        if (!display) return;
+
+        // Layout constants
+        const int16_t margin = 5;
+        const int16_t dw = display->width();
+        const int16_t headerY = 26;
+        const int16_t headerH = 20;
+        const int16_t boxY = headerY + headerH;
+        const int16_t boxH = 58;
+        const int16_t boxInnerW = dw - 2 * margin;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator and power status in top strip
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            if (isEncrypted) {
+                drawLockIcon();
+            }
+
+            // Header bar — filled black rectangle with white centered text
+            display->fillRect(margin, headerY, boxInnerW, headerH, GxEPD_BLACK);
+            {
+                display->setFont(nullptr);
+                display->setTextColor(GxEPD_WHITE);
+
+                char headerText[96];
+                if (channel[0] != '\0') {
+                    snprintf(headerText, sizeof(headerText), "#%s  %c  Announcement",
+                             channel, (char)0xF9);  // 0xF9 = middle dot in default font
+                } else {
+                    snprintf(headerText, sizeof(headerText), "Announcement");
+                }
+
+                int16_t tx, ty;
+                uint16_t tw, th;
+                display->getTextBounds(headerText, 0, 0, &tx, &ty, &tw, &th);
+                int16_t hx = margin + (boxInnerW - (int16_t)tw) / 2;
+                int16_t hy = headerY + (headerH - (int16_t)th) / 2 - ty;
+                display->setCursor(hx, hy);
+                display->print(headerText);
+
+                display->setTextColor(GxEPD_BLACK);
+            }
+
+            // Message box — outlined rectangle below header bar
+            display->drawRect(margin, boxY, boxInnerW, boxH, GxEPD_BLACK);
+
+            // Source name — bold, centered inside the box
+            display->setFont(&FreeSansBold9pt7b);
+            {
+                int16_t sx, sy;
+                uint16_t sw, sh;
+                display->getTextBounds(source, 0, 0, &sx, &sy, &sw, &sh);
+                display->setCursor(margin + (boxInnerW - (int16_t)sw) / 2, boxY + 16);
+                display->print(source);
+            }
+
+            // Message body — regular font, word-wrap across up to 2 lines, centered
+            display->setFont(&FreeSans9pt7b);
+            {
+                String msg(message);
+                if (msg.length() > 0) {
+                    constexpr int maxChars = 28;
+                    if ((int)msg.length() <= maxChars) {
+                        int16_t mx, my;
+                        uint16_t mw, mh;
+                        display->getTextBounds(msg.c_str(), 0, 0, &mx, &my, &mw, &mh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)mw) / 2, boxY + 34);
+                        display->print(msg);
+                    } else {
+                        int splitPos = msg.lastIndexOf(' ', maxChars);
+                        if (splitPos < 0) splitPos = maxChars;
+                        String line1 = msg.substring(0, splitPos);
+                        String line2 = msg.substring(splitPos);
+                        line2.trim();
+                        if ((int)line2.length() > maxChars) {
+                            line2 = line2.substring(0, maxChars - 3) + "...";
+                        }
+
+                        // Line 1 centered
+                        int16_t lx, ly;
+                        uint16_t lw, lh;
+                        display->getTextBounds(line1.c_str(), 0, 0, &lx, &ly, &lw, &lh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)lw) / 2, boxY + 34);
+                        display->print(line1);
+
+                        // Line 2 centered
+                        display->getTextBounds(line2.c_str(), 0, 0, &lx, &ly, &lw, &lh);
+                        display->setCursor(margin + (boxInnerW - (int16_t)lw) / 2, boxY + 52);
+                        display->print(line2);
+                    }
+                }
+            }
+
+            // Platform label — small font, bottom-left
+            if (platform[0] != '\0') {
+                display->setFont(nullptr);
+                String plat(platform);
+                if (plat.length() > 0) {
+                    plat.setCharAt(0, toupper(plat.charAt(0)));
+                }
+                display->setCursor(10, display->height() - 8);
+                display->print(plat);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Branded splash screen: left half black, right half white, "pebl" wordmark centered
+    // spanning both halves ("pe" in white on black, "bl" in black on white)
+    static void showSplashScreen(const String& version) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing splash screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+
+            // Fill left half black
+            int16_t halfWidth = display->width() / 2;
+            display->fillRect(0, 0, halfWidth, display->height(), GxEPD_BLACK);
+
+            // Measure full "pebl" text to center it
+            display->setFont(&FreeSansBold18pt7b);
+            display->setTextColor(GxEPD_BLACK);
+            int16_t tbx, tby;
+            uint16_t tbw, tbh;
+            display->getTextBounds("pebl", 0, 0, &tbx, &tby, &tbw, &tbh);
+
+            // Center the full word on the display
+            int16_t x = (display->width() - tbw) / 2 - tbx;
+            int16_t y = (display->height() - tbh) / 2 - tby;
+
+            // Render "pe" in white (on the black half)
+            display->setTextColor(GxEPD_WHITE);
+            display->setCursor(x, y);
+            display->print("pe");
+
+            // Measure "pe" width to position "bl"
+            uint16_t peW, peH;
+            int16_t pex, pey;
+            display->getTextBounds("pe", 0, 0, &pex, &pey, &peW, &peH);
+
+            // Render "bl" in black (on the white half)
+            display->setTextColor(GxEPD_BLACK);
+            display->setCursor(x + peW + pex - tbx, y);
+            display->print("bl");
+
+            // Version in small font, bottom-right corner
+            if (!version.isEmpty()) {
+                display->setFont(&FreeSans9pt7b);
+                int16_t vx, vy;
+                uint16_t vw, vh;
+                display->getTextBounds(version, 0, 0, &vx, &vy, &vw, &vh);
+                display->setCursor(display->width() - vw - 5, display->height() - 5);
+                display->print(version);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Boot status screen: "Connecting..." centered with device name below, battery top-right
+    static void showBootStatus(const String& deviceName) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing boot status screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right
+            drawBatteryIndicator();
+
+            // "Connecting..." centered
+            display->setFont(&FreeSans9pt7b);
+            int16_t tx, ty;
+            uint16_t tw, th;
+            display->getTextBounds("Connecting to Server...", 0, 0, &tx, &ty, &tw, &th);
+            int16_t cx = (display->width() - tw) / 2;
+            int16_t cy = (display->height() - th) / 2 - ty;
+            display->setCursor(cx, cy);
+            display->print("Connecting to Server...");
+
+            // Device name below
+            if (!deviceName.isEmpty()) {
+                int16_t nx, ny;
+                uint16_t nw, nh;
+                display->getTextBounds(deviceName, 0, 0, &nx, &ny, &nw, &nh);
+                display->setCursor((display->width() - nw) / 2, cy + th + 8);
+                display->print(deviceName);
+            }
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Connected screen: checkmark icon, "Connected!" in bold, subtitle centered below
+    static void showConnectedScreen(bool showLockIcon = false) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing connected screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right (dots) and power status text top-center ("BATTERY" / "LOW BATT")
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Lock icon if encryption enabled
+            if (showLockIcon) {
+                drawLockIcon();
+            }
+
+            // Layout: checkmark, "Connected!", subtitle — all centered vertically as a group
+            // Measure text to calculate total group height
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t c1x, c1y;
+            uint16_t c1w, c1h;
+            display->getTextBounds("Connected!", 0, 0, &c1x, &c1y, &c1w, &c1h);
+
+            display->setFont(&FreeSans9pt7b);
+            int16_t c2x, c2y;
+            uint16_t c2w, c2h;
+            display->getTextBounds("Waiting for Reactions..", 0, 0, &c2x, &c2y, &c2w, &c2h);
+
+            int16_t checkSize = 20;   // Checkmark bounding box
+            int16_t gap1 = 10;        // Space between checkmark and "Connected!"
+            int16_t gap2 = 6;         // Space between "Connected!" and subtitle
+            int16_t totalHeight = checkSize + gap1 + c1h + gap2 + c2h;
+            int16_t startY = (display->height() - totalHeight) / 2;
+            int16_t centerX = display->width() / 2;
+
+            // Draw checkmark: a simple "V" shape drawn with thick lines
+            int16_t checkCenterX = centerX;
+            int16_t checkTopY = startY;
+            // Checkmark points: left, bottom-center, top-right
+            int16_t lx = checkCenterX - 10;
+            int16_t ly = checkTopY + 10;
+            int16_t mx = checkCenterX - 3;
+            int16_t my = checkTopY + 18;
+            int16_t rx = checkCenterX + 10;
+            int16_t ry = checkTopY + 2;
+            // Draw with thickness by offsetting
+            for (int t = 0; t < 3; t++) {
+                display->drawLine(lx, ly + t, mx, my + t, GxEPD_BLACK);
+                display->drawLine(mx, my + t, rx, ry + t, GxEPD_BLACK);
+            }
+
+            // "Connected!" in bold, centered
+            int16_t textY = startY + checkSize + gap1;
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(centerX - c1w / 2, textY + c1h);
+            display->print("Connected!");
+
+            // "Waiting for Reactions.." in regular, centered below
+            int16_t subY = textY + c1h + gap2;
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(centerX - c2w / 2, subY + c2h);
+            display->print("Waiting for Reactions..");
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Disconnected screen: X icon, "Connection Lost" in bold, subtitle centered below
+    static void showDisconnectedScreen(const String& subtitle = "Check WiFi/Server") {
+        logMessage(LOG_INFO, "DISPLAY", "Showing disconnected screen");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Battery indicator top-right
+            drawBatteryIndicator();
+
+            // Measure text to calculate total group height
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t c1x, c1y;
+            uint16_t c1w, c1h;
+            display->getTextBounds("Connection Lost", 0, 0, &c1x, &c1y, &c1w, &c1h);
+
+            display->setFont(&FreeSans9pt7b);
+            int16_t c2x, c2y;
+            uint16_t c2w, c2h;
+            display->getTextBounds(subtitle, 0, 0, &c2x, &c2y, &c2w, &c2h);
+
+            int16_t iconSize = 20;
+            int16_t gap1 = 10;
+            int16_t gap2 = 6;
+            int16_t totalHeight = iconSize + gap1 + c1h + gap2 + c2h;
+            int16_t startY = (display->height() - totalHeight) / 2;
+            int16_t centerX = display->width() / 2;
+
+            // Draw X icon with thick lines
+            int16_t ix = centerX - 8;
+            int16_t iy = startY + 2;
+            int16_t iSize = 16;
+            for (int t = 0; t < 3; t++) {
+                display->drawLine(ix, iy + t, ix + iSize, iy + iSize + t, GxEPD_BLACK);
+                display->drawLine(ix + iSize, iy + t, ix, iy + iSize + t, GxEPD_BLACK);
+            }
+
+            // "Connection Lost" in bold, centered
+            int16_t textY = startY + iconSize + gap1;
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(centerX - c1w / 2, textY + c1h);
+            display->print("Connection Lost");
+
+            // Subtitle in regular, centered below
+            int16_t subY = textY + c1h + gap2;
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(centerX - c2w / 2, subY + c2h);
+            display->print(subtitle);
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    static void showReaction(const JsonObject& reaction) {
+        // Extract data with safe defaults (matching server field names)
+        const char* emoji = reaction["emoji"] | "?";
+        const char* emoji_url = reaction["emoji_url"] | "";
+        const char* user = reaction["user"] | "Unknown";
+        const char* channel = reaction["channel"] | "Unknown";
+        const char* message = reaction["message"] | "";
+        const char* platform = reaction["platform"] | "";
+        bool isEncrypted = reaction["encrypted"] | false;
+
+        char logBuf[256];
+        snprintf(logBuf, sizeof(logBuf), "emoji=%s user=%s channel=%s encrypted=%s has_url=%s",
+                 emoji, user, channel, isEncrypted ? "true" : "false", emoji_url[0] ? "yes" : "no");
+        logMessage(LOG_INFO, "DISPLAY", "Showing reaction", logBuf);
+
+        // Save reaction data to RTC memory for redraw after deep sleep
+        displayShowingConnectionLost = false;
+        saveReactionToRTC(emoji, emoji_url, user, channel, message, platform, isEncrypted);
+        logMessage(LOG_INFO, "RTC", "Saved reaction to RTC memory for deep sleep recovery");
+
+        if (!display) return; // Safety check
+
+        // Step 1: Start display transaction
+        display->setFullWindow();
+        display->firstPage();
+
+        // Step 2: Render emoji ONCE (download happens only on first page iteration)
+        // Emoji renders once on first page (memory constraints prevent caching for multi-page displays)
+        bool emojiDownloaded = false;
+        bool emojiRendered = false;
+
+        do {
+            // Clear display buffer
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator in top-right
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();  // Show "BATTERY" in top center when on battery
+
+            // Encryption indicator at top left corner using lock icon
+            if (isEncrypted) {
+                drawLockIcon();
+            }
+
+            // Render emoji (download only on first page iteration)
+            if (emoji_url[0] != '\0' && !emojiDownloaded) {
+                // Download and render emoji (only happens once per showReaction call)
+                emojiRendered = EmojiRenderer::renderEmojiFromURL(emoji_url,
+                                                                   DisplayLimits::EMOJI_X,
+                                                                   DisplayLimits::EMOJI_Y);
+                emojiDownloaded = true;  // Mark as downloaded for this reaction
+            }
+
+            // Text fallback: display emoji text as-is (server already formats with colons)
+            // Server sends emoji field as ":emoji_name:" so no need to add extra colons
+            if (!emojiRendered) {
+                display->setFont(&FreeSans12pt7b);
+                display->setCursor(10, 57);  // Aligned with balanced layout
+                display->print(emoji);
+            }
+
+            // Reaction details - using smart truncation to prevent text wrapping
+            // Calculate available width: display width - x position - right margin
+            const int16_t rightMargin = 5;  // 5px margin from right edge
+
+            // User name at top (bold font)
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t userX = 60;
+            int16_t userMaxWidth = display->width() - userX - rightMargin;
+            String userStr = truncateToFit(user, &FreeSansBold9pt7b, userX, userMaxWidth);
+            display->setCursor(userX, 42);  // Positioned for balanced layout
+            display->print(userStr);
+
+            // Message text below user name (italicized font, with small whitespace)
+            if (message[0] != '\0') {
+                display->setFont(&FreeSansOblique9pt7b);  // Use italicized font for message text
+                int16_t messageX = 60;
+                int16_t messageMaxWidth = display->width() - messageX - rightMargin;
+                String messageStr = truncateToFit(message, &FreeSansOblique9pt7b, messageX, messageMaxWidth);
+                display->setCursor(messageX, 62);  // Positioned for balanced layout with spacing
+                display->print(messageStr);
+            }
+
+            // "From: {channel}" at bottom right, italicized (with extra spacing)
+            display->setFont(&FreeSansOblique9pt7b);
+            String channelLabel = "From: " + String(channel);
+
+            // Calculate max width for channel label (leave space on left for emoji area)
+            const int16_t leftPadding = 60;  // Match user/message text left edge
+            int16_t channelMaxWidth = display->width() - leftPadding - rightMargin;
+
+            // Truncate channel label to fit available width
+            String truncatedChannel = truncateToFit(channelLabel.c_str(),
+                                                    &FreeSansOblique9pt7b,
+                                                    0,
+                                                    channelMaxWidth);
+
+            // Calculate text width to right-align
+            int16_t x1, y1;
+            uint16_t w, h;
+            display->getTextBounds(truncatedChannel, 0, 0, &x1, &y1, &w, &h);
+
+            int16_t channelX = display->width() - w - rightMargin;
+            display->setCursor(channelX, 92);  // Positioned closer to message content
+            display->print(truncatedChannel);
+
+            // Platform indicator at bottom left (e.g. "Slack", "Discord")
+            if (platform[0] != '\0') {
+                display->setFont(nullptr);  // Default small font
+                display->setCursor(10, display->height() - 14);
+                // Capitalize first letter for display
+                String platformStr = platform;
+                platformStr[0] = toupper(platformStr[0]);
+                display->print(platformStr);
+            }
+
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+    }
+
+    // Show WiFi provisioning mode with QR code
+    static void showProvisioningMode(const String& ssid, const String& ip) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing provisioning mode");
+
+        if (!display) return;  // Safety check
+
+        // Generate WiFi QR code for iOS 18+/Android 10+ auto-connect
+        String qrData = "WIFI:T:nopass;S:" + ssid + ";P:;;";
+
+        // Initialize QR code (version 3 = 29x29 modules, good for WiFi strings)
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(3)];
+        qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, qrData.c_str());
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator and power status
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(10, 28);
+            display->print("WiFi Setup");
+
+            // QR Code - positioned on the left side
+            // Scale factor: 2 pixels per module for 29x29 = 58x58 total
+            const uint8_t scale = 2;
+            const uint8_t qrPixelSize = qrcode.size * scale;
+            const int16_t qrX = 10;   // Left margin
+            const int16_t qrY = 43;   // Below title
+
+            // Draw each QR code module
+            for (uint8_t y = 0; y < qrcode.size; y++) {
+                for (uint8_t x = 0; x < qrcode.size; x++) {
+                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
+                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
+                }
+            }
+
+            // Instructions on the right side of QR code
+            display->setFont(nullptr);  // Small default font
+            const int16_t textX = qrX + qrPixelSize + 7;  // 7px gap from QR code
+            int16_t textY = qrY;  // Align with top of QR code
+
+            display->setCursor(textX, textY);
+            display->print("Network:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print(ssid.c_str());
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("Scan QR or go to");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("Settings > WiFi");
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("Portal: ");
+            display->print(ip.c_str());
+
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Provisioning mode displayed");
+    }
+
+    /**
+     * Display trial expiry screen with QR code for purchasing an activation key.
+     * Shows a scannable QR code (left) encoding the full checkout URL with device_id,
+     * and text instructions (right) including "Trial Expired" header and device ID.
+     * Falls back to text-only display if URL is too long for QR or generation fails.
+     *
+     * @param purchaseUrl Full checkout URL with device_id query param
+     * @param deviceId The device ID to display for identification
+     */
+    static void showPurchaseQRCode(const String& purchaseUrl, const String& deviceId) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing purchase QR code for trial expiry");
+
+        if (!display) return;
+
+        // Determine QR version based on URL length (byte encoding for URLs with :/?=)
+        // Version 5: up to 106 bytes, Version 6: up to 134 bytes (max for display)
+        // Typical URL: "https://pebl.ink/checkout?device_id=a1b2c3d4e5f6" (~54 chars)
+        uint8_t qrVersion;
+        size_t urlLen = purchaseUrl.length();
+        if (urlLen <= 106) {
+            qrVersion = 5;
+        } else if (urlLen <= 134) {
+            qrVersion = 6;
+        } else {
+            // URL too long for QR — fall back to text-only display
+            logMessage(LOG_WARN, "DISPLAY", "Purchase URL too long for QR code");
+            showMessage("Trial Expired", "Purchase key at:", purchaseUrl, String("ID: ") + deviceId);
+            return;
+        }
+
+        QRCode qrcode;
+        uint8_t qrcodeData[qrcode_getBufferSize(qrVersion)];
+        int8_t qrResult = qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_LOW, purchaseUrl.c_str());
+
+        if (qrResult != 0) {
+            logMessage(LOG_ERROR, "DISPLAY", "Purchase QR code generation failed");
+            showMessage("Trial Expired", "Purchase key at:", purchaseUrl, String("ID: ") + deviceId);
+            return;
+        }
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // QR code on the left, below battery indicator row (extra padding to avoid crowding)
+            const uint8_t scale = 2;
+            const int16_t qrX = 5;
+            const int16_t qrY = 28;
+
+            for (uint8_t y = 0; y < qrcode.size; y++) {
+                for (uint8_t x = 0; x < qrcode.size; x++) {
+                    uint16_t color = qrcode_getModule(&qrcode, x, y) ? GxEPD_BLACK : GxEPD_WHITE;
+                    display->fillRect(qrX + (x * scale), qrY + (y * scale), scale, scale, color);
+                }
+            }
+
+            // Right column: title then instructions
+            const int16_t textX = qrX + (qrcode.size * scale) + 5;
+            int16_t textY = qrY + 10;
+
+            display->setFont(&FreeSansBold9pt7b);
+            display->setCursor(textX, textY);
+            display->print("Trial Expired");
+
+            display->setFont(nullptr);  // Small default font for instructions
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("Scan to purchase");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print("activation key");
+
+            textY += 14;
+            display->setCursor(textX, textY);
+            display->print("ID:");
+
+            textY += 10;
+            display->setCursor(textX, textY);
+            display->print(deviceId.substring(0, 20).c_str());
+
+        } while (display->nextPage());
+
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Purchase QR code displayed");
+    }
+
+    /**
+     * Display self-service pairing code on e-paper.
+     * Shows a human-readable 8-character code (e.g., "ABCD-1234") that the user
+     * enters in Slack to link their account to this device. Used when auth_token
+     * is empty (self-service provisioning flow).
+     *
+     * @param pairingCode The 8-character pairing code with hyphen (e.g., "ABCD-1234")
+     * @param deviceId The device ID to display for identification
+     */
+    static void showPairingCode(const String& pairingCode, const String& deviceId) {
+        logMessage(LOG_INFO, "DISPLAY", "Showing pairing code for device linking");
+
+        if (!display) return;
+
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator in top-right
+            drawBatteryIndicator();
+            drawPowerStatusIndicator();
+
+            // Title: "Pair Your Device"
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(10, 30);
+            display->print("Pair Your Device");
+
+            // Pairing code in outlined box for visual prominence
+            display->setFont(&FreeSansBold9pt7b);
+            int16_t tx, ty;
+            uint16_t tw, th;
+            display->getTextBounds(pairingCode.c_str(), 0, 0, &tx, &ty, &tw, &th);
+            const int boxPad = 6;
+            const int boxX = 8;
+            const int boxY = 38;
+            const int boxW = tw + boxPad * 2;
+            const int boxH = th + boxPad * 2;
+            display->drawRect(boxX, boxY, boxW, boxH, GxEPD_BLACK);
+            display->setCursor(boxX + boxPad - tx, boxY + boxPad - ty);
+            display->print(pairingCode);
+
+            // Instructions (positioned below the box)
+            int instrY = boxY + boxH + 14;
+            display->setFont(&FreeSans9pt7b);
+            display->setCursor(10, instrY);
+            display->print("Enter code in Slack");
+
+            // Device ID (truncated to fit on 212px wide display)
+            display->setFont(nullptr);  // Small default font for device ID
+            String idLabel = "ID: " + deviceId.substring(0, 20);
+            display->setCursor(10, instrY + 16);
+            display->print(idLabel.c_str());
+
+            display->setFont(&FreeSans9pt7b);  // Restore font
+        } while (display->nextPage());
+
+        // Update display state flags after full refresh
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Pairing code displayed");
+    }
+
+    /**
+     * Display low battery warning screen.
+     * Shows large centered text asking user to charge the device.
+     * Called when battery is critically low (<15%) before entering deep sleep.
+     */
+    static void showLowBatteryWarning() {
+        if (!display) return;
+
+        logMessage(LOG_WARN, "DISPLAY", "Showing low battery warning screen");
+
+        // Full window refresh for critical warning
+        display->setFullWindow();
+        display->firstPage();
+
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+
+            // Draw battery indicator in top-right (showing low level)
+            drawBatteryIndicator();
+
+            // Main warning text: "LOW BATTERY" (large, centered)
+            display->setFont(&FreeSans12pt7b);
+            const char* line1 = "LOW BATTERY";
+
+            int16_t x1, y1;
+            uint16_t w1, h1;
+            display->getTextBounds(line1, 0, 0, &x1, &y1, &w1, &h1);
+            int16_t x1_pos = (display->width() - w1) / 2;
+            int16_t y1_pos = (display->height() / 2) - 10;  // Slightly above center
+
+            display->setCursor(x1_pos, y1_pos);
+            display->print(line1);
+
+            // Secondary text: charge instruction (regular font, centered)
+            display->setFont(&FreeSans9pt7b);
+            const char* line2 = "Charge, then press";
+            const char* line3 = "button to restart";
+
+            uint16_t w2, h2;
+            display->getTextBounds(line2, 0, 0, &x1, &y1, &w2, &h2);
+            int16_t x2_pos = (display->width() - w2) / 2;
+            int16_t y2_pos = y1_pos + 25;  // 25px below first line
+
+            display->setCursor(x2_pos, y2_pos);
+            display->print(line2);
+
+            uint16_t w3, h3;
+            display->getTextBounds(line3, 0, 0, &x1, &y1, &w3, &h3);
+            int16_t x3_pos = (display->width() - w3) / 2;
+            int16_t y3_pos = y2_pos + 20;  // 20px below second line
+
+            display->setCursor(x3_pos, y3_pos);
+            display->print(line3);
+
+        } while (display->nextPage());
+
+        // Update display state
+        updateDisplayStateAfterFullRefresh();
+
+        logMessage(LOG_INFO, "DISPLAY", "Low battery warning displayed");
+    }
+
+private:
+    // Smart truncation that accounts for actual rendered text width
+    static String truncateToFit(const char* str, const GFXfont* font, int16_t x, int16_t maxWidth) {
+        if (!display) return String(str);
+
+        String result(str);
+        if (result.isEmpty()) return result;
+
+        // Set font to measure correctly
+        display->setFont(font);
+
+        // Check if text fits
+        int16_t x1, y1;
+        uint16_t w, h;
+        display->getTextBounds(result.c_str(), x, 0, &x1, &y1, &w, &h);
+
+        // If it fits, return as-is
+        if (w <= maxWidth) {
+            return result;
+        }
+
+        // Truncate character by character until it fits (with ellipsis)
+        while (w > maxWidth && result.length() > 3) {
+            result = result.substring(0, result.length() - 1);
+            String withEllipsis = result + "...";
+            display->getTextBounds(withEllipsis.c_str(), x, 0, &x1, &y1, &w, &h);
+
+            if (w <= maxWidth) {
+                return withEllipsis;
+            }
+        }
+
+        // Fallback: just return "..." if even 3 chars don't fit
+        return "...";
+    }
+};
+
+/**
+ * Restore last displayed content from RTC memory.
+ * Dispatches to the correct renderer based on content type.
+ * Returns true if content was restored, false if nothing saved.
+ */
+static bool restoreLastDisplay() {
+    switch (lastDisplay.contentType) {
+    case DISPLAY_CONTENT_REACTION: {
+        logMessage(LOG_INFO, "RTC", "Restoring last reaction from RTC memory");
+        JsonDocument doc;
+        doc["emoji"] = lastDisplay.reaction.emoji;
+        doc["emoji_url"] = lastDisplay.reaction.emojiUrl;
+        doc["user"] = lastDisplay.reaction.user;
+        doc["channel"] = lastDisplay.reaction.channel;
+        doc["message"] = lastDisplay.reaction.message;
+        doc["platform"] = lastDisplay.reaction.platform;
+        doc["encrypted"] = lastDisplay.reaction.isEncrypted;
+        DisplayManager::showReaction(doc.as<JsonObject>());
+        return true;
+    }
+    case DISPLAY_CONTENT_BROADCAST: {
+        logMessage(LOG_INFO, "RTC", "Restoring last broadcast from RTC memory");
+        JsonDocument doc;
+        doc["user"] = lastDisplay.broadcast.source;
+        doc["message"] = lastDisplay.broadcast.message;
+        doc["platform"] = lastDisplay.broadcast.platform;
+        doc["channel"] = lastDisplay.broadcast.channel;
+        doc["encrypted"] = lastDisplay.broadcast.encrypted;
+        DisplayManager::showBroadcast(doc.as<JsonObject>());
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// ============================================================================
+// Display Hardware Initialization Helper
+// ============================================================================
+
+/**
+ * Initialize display hardware (SPI + display driver)
+ * Can be called multiple times safely (checks if display already initialized)
+ * Used by both normal setup() and long-press config mode entry
+ */
+void initializeDisplayHardware() {
+    if (display != nullptr) {
+        logMessage(LOG_DEBUG, "DISPLAY", "Already initialized - skipping");
+        return;  // Already initialized
+    }
+
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Pin definitions — pebl.ink ESP32-S3 board.
+    // Reverse-engineered 2026-06-13 (factory firmware was erased). See
+    // EINK_PIN_DISCOVERY.md for the full story.
+    constexpr uint8_t PIN_DISPLAY_PWR  = 13;  // panel power enable — MUST drive HIGH
+    constexpr uint8_t PIN_DISPLAY_SCLK = 10;
+    constexpr uint8_t PIN_DISPLAY_MOSI = 9;
+    constexpr uint8_t PIN_DISPLAY_CS   = 16;
+    constexpr uint8_t PIN_DISPLAY_DC   = 12;
+    constexpr uint8_t PIN_DISPLAY_RST  = 8;
+    constexpr uint8_t PIN_DISPLAY_BUSY = 14;
+
+    // 1) Power the panel — without this, nothing reaches the display.
+    pinMode(PIN_DISPLAY_PWR, OUTPUT);
+    digitalWrite(PIN_DISPLAY_PWR, HIGH);
+    delay(300);
+
+    // 2) Pre-claim control pins as GPIO so GxEPD2's early writes don't trip the
+    //    ESP32-S3 peripheral manager ("IO X is not set as GPIO").
+    pinMode(PIN_DISPLAY_CS,  OUTPUT); digitalWrite(PIN_DISPLAY_CS, HIGH);
+    pinMode(PIN_DISPLAY_DC,  OUTPUT); digitalWrite(PIN_DISPLAY_DC, LOW);
+    pinMode(PIN_DISPLAY_RST, OUTPUT); digitalWrite(PIN_DISPLAY_RST, HIGH);
+    pinMode(PIN_DISPLAY_BUSY, INPUT);
+
+    // 3) Configure SPI pins. CS is managed by GxEPD2 as a software GPIO, so do
+    //    NOT hand it to SPI.begin() (pass -1) — doing so causes periman conflicts.
+    SPI.begin(PIN_DISPLAY_SCLK, -1, PIN_DISPLAY_MOSI, -1);
+
+    // Create display instance based on build flags
+    #ifdef DISPLAY_4G_GRAYSCALE
+        #if defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 212
+            #ifdef DISPLAY_GDEW0213I5F
+                display = new GxEPD2_4G_4G<GxEPD2_213_flex, GxEPD2_213_flex::HEIGHT>(
+                    GxEPD2_213_flex(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+                );
+                logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" 4G grayscale (GDEW0213I5F)");
+            #else
+                display = new GxEPD2_4G_4G<GxEPD2_213_GDEY0213B74, GxEPD2_213_GDEY0213B74::HEIGHT>(
+                    GxEPD2_213_GDEY0213B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+                );
+                logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" 4G grayscale (GDEY0213B74)");
+            #endif
+        #endif
+    #else
+        // 2-level black & white displays
+        #if defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 264 && defined(DISPLAY_HEIGHT) && DISPLAY_HEIGHT == 176
+            display = new GxEPD2_BW<GxEPD2_270, GxEPD2_270::HEIGHT>(
+                GxEPD2_270(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+            );
+            logMessage(LOG_INFO, "DISPLAY", "Driver: 2.7\" BW (GxEPD2_270)");
+        #elif defined(DISPLAY_WIDTH) && DISPLAY_WIDTH == 212
+            #ifdef DISPLAY_GDEW0213T5D
+                display = new GxEPD2_BW<GxEPD2_213_T5D, GxEPD2_213_T5D::HEIGHT>(
+                    GxEPD2_213_T5D(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+                );
+                logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW (GxEPD2_213_T5D)");
+            #else
+                display = new GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>(
+                    GxEPD2_213_B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+                );
+                logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW (GxEPD2_213_B74)");
+            #endif
+        #else
+            // Default to 2.13" BW if dimensions not specified
+            display = new GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>(
+                GxEPD2_213_B74(PIN_DISPLAY_CS, PIN_DISPLAY_DC, PIN_DISPLAY_RST, PIN_DISPLAY_BUSY)
+            );
+            logMessage(LOG_INFO, "DISPLAY", "Driver: 2.13\" BW (default)");
+        #endif
+    #endif
+
+    // Initialize display
+    // Skip initial full-clear refresh when waking from any deep sleep source (timer or button).
+    // The initial refresh adds ~5s of blocking time, which inflates button hold duration
+    // measurement and causes the tiered button handler to misfire.
+    esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
+    bool fromDeepSleep = (wakeup == ESP_SLEEP_WAKEUP_TIMER || wakeup == ESP_SLEEP_WAKEUP_EXT0);
+    display->init(115200, !fromDeepSleep, 2, false);
+    display->setRotation(cfg.display.rotation);
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "rotation=%d", cfg.display.rotation);
+    logMessage(LOG_INFO, "DISPLAY", "Initialized", buf);
+}
+
+// ============================================================================
+// Power Management - Consolidated Battery Status
+// ============================================================================
+struct BatteryStatus {
+    float voltage;      // Battery voltage (2.5-4.2V valid range, 5.0 = no battery)
+    int percentage;     // 0-100%, -1 = no battery
+    int level;          // 0-3 circles for display, -1 = no battery
+    bool isUSBPowered;  // true if USB connected (voltage >= usb_threshold_v from config)
+    bool hasBattery;    // true if valid battery detected
+};
+
+/**
+ * Initialize ADC calibration using factory eFuse data
+ *
+ * Corrects ESP32 ADC non-linearity for accurate battery voltage readings.
+ * ESP32 ADC has significant non-linearity (up to 5-8% error at certain voltages)
+ * especially in the 3.0-4.2V battery range. Factory calibration data stored in
+ * eFuse corrects this using a curve-fitting algorithm.
+ *
+ * Impact: Improves battery % accuracy from ±10% to ±2-3%, particularly at
+ * critical thresholds (low battery detection, USB detection).
+ *
+ * Should be called once during setup() before first battery reading.
+ */
+void setupADCCalibration() {
+    // Prevent double initialization (defensive programming)
+    // Handle should be nullptr on boot/wake, but check anyway
+    if (adc_cali_handle != nullptr) {
+        logMessage(LOG_DEBUG, "ADC", "Calibration already initialized - skipping");
+        return;
+    }
+
+    // Create calibration configuration for ADC1, 12dB attenuation (0-3.9V range)
+    // Matches the attenuation used in getBatteryStatus() for battery monitoring
+    // Note: ESP32 (original) uses line_fitting, ESP32-S2/S3/C3 use curve_fitting
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    esp_err_t ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle);
+#else
+    adc_cali_line_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,              // Using ADC1 (GPIO 35/36)
+        .atten = ADC_ATTEN_DB_12,           // 12dB attenuation (0-3.9V range)
+        .bitwidth = ADC_BITWIDTH_12,        // 12-bit resolution (0-4095)
+    };
+
+    // Create calibration scheme using factory eFuse data
+    esp_err_t ret = adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle);
+#endif
+
+    if (ret == ESP_OK) {
+        logMessage(LOG_INFO, "ADC", "Calibration initialized using eFuse data");
+    } else if (ret == ESP_ERR_NOT_SUPPORTED) {
+        // Some ESP32 chips don't have eFuse calibration data burned
+        logMessage(LOG_WARN, "ADC", "Calibration not supported - using linear calculation");
+        adc_cali_handle = nullptr;  // Will fall back to linear scaling
+    } else {
+        logMessage(LOG_ERROR, "ADC", "Calibration init failed - using linear calculation");
+        adc_cali_handle = nullptr;
+    }
+}
+
+// Battery status cache to avoid excessive ADC sampling (200ms per call)
+// Reuses cached result if called within 1 second
+static BatteryStatus cachedBatteryStatus = {5.0, -1, -1, false, false};
+static unsigned long lastBatteryReadTime = 0;
+
+BatteryStatus getBatteryStatus(bool forceRefresh = false) {
+    using namespace BatteryConstants;
+
+    // Return cached value if less than 1 second old (unless forced)
+    unsigned long now = millis();
+    if (!forceRefresh && cachedBatteryStatus.hasBattery &&
+        (unsigned long)(now - lastBatteryReadTime) < 1000) {
+        return cachedBatteryStatus;
+    }
+
+    BatteryStatus status = {5.0, -1, -1, false, false};
+
+    // Read battery voltage via ADC (LilyGo T5 uses GPIO 35 or 36)
+    adc1_config_width(ADC_WIDTH_BIT_12);
+
+    // Test both pins, use whichever has higher reading
+    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_12);
+    delay(10);
+    int test_35 = adc1_get_raw(ADC1_CHANNEL_7);
+
+    adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
+    delay(10);
+    int test_36 = adc1_get_raw(ADC1_CHANNEL_0);
+
+    // Reject floating pins (reading >= 4000 = likely floating/invalid)
+    // Pick the pin with valid battery range (100-3900)
+    bool pin35_valid = (test_35 >= 100 && test_35 < 4000);
+    bool pin36_valid = (test_36 >= 100 && test_36 < 4000);
+
+    adc1_channel_t channel;
+    if (pin35_valid && !pin36_valid) {
+        channel = ADC1_CHANNEL_7;  // Only GPIO35 valid
+    } else if (pin36_valid && !pin35_valid) {
+        channel = ADC1_CHANNEL_0;  // Only GPIO36 valid
+    } else {
+        // Both valid or both invalid - pick higher reading
+        channel = (test_35 > test_36) ? ADC1_CHANNEL_7 : ADC1_CHANNEL_0;
+    }
+
+    // Sample voltage multiple times for stability and USB detection
+    // Store raw ADC values to reuse for both percentage and USB detection
+    int rawSamples[ADC_SAMPLE_COUNT];
+    float voltageSamples[ADC_SAMPLE_COUNT];
+    int total = 0, min_val = ADC_RESOLUTION, max_val = 0;
+
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        rawSamples[i] = adc1_get_raw(channel);
+
+        // Convert raw ADC to voltage using calibration if available
+        if (adc_cali_handle != nullptr) {
+            int voltage_mv;
+            esp_err_t ret = adc_cali_raw_to_voltage(adc_cali_handle, rawSamples[i], &voltage_mv);
+            if (ret == ESP_OK) {
+                voltageSamples[i] = (voltage_mv / 1000.0) * ADC_VOLTAGE_DIVIDER;  // mV → V, apply divider
+            } else {
+                // Calibration failed - fall back to linear calculation for this sample
+                voltageSamples[i] = (rawSamples[i] / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
+            }
+        } else {
+            // Fallback to linear calculation if calibration unavailable
+            voltageSamples[i] = (rawSamples[i] / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
+        }
+
+        total += rawSamples[i];
+        if (rawSamples[i] < min_val) min_val = rawSamples[i];
+        if (rawSamples[i] > max_val) max_val = rawSamples[i];
+
+        delay(ADC_SAMPLE_DELAY_MS);
+    }
+
+    int adc_avg = total / ADC_SAMPLE_COUNT;
+    int variance = max_val - min_val;
+
+    // Convert to voltage using averaged ADC reading with calibration
+    if (adc_cali_handle != nullptr) {
+        int voltage_mv;
+        esp_err_t ret = adc_cali_raw_to_voltage(adc_cali_handle, adc_avg, &voltage_mv);
+        if (ret == ESP_OK) {
+            status.voltage = (voltage_mv / 1000.0) * ADC_VOLTAGE_DIVIDER;  // mV → V, apply 2:1 divider
+        } else {
+            // Calibration failed - fall back to linear calculation
+            status.voltage = (adc_avg / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
+        }
+    } else {
+        // Fallback to linear calculation if calibration unavailable
+        status.voltage = (adc_avg / float(ADC_RESOLUTION)) * ADC_MAX_VOLTAGE * ADC_VOLTAGE_DIVIDER;
+    }
+
+    // Detect no-battery conditions using constants
+    if (variance >= NO_BATTERY_VARIANCE_THRESHOLD ||
+        adc_avg < NO_BATTERY_MIN_ADC ||
+        adc_avg > NO_BATTERY_MAX_ADC ||
+        status.voltage < NO_BATTERY_MIN_VOLTAGE ||
+        status.voltage > NO_BATTERY_MAX_VOLTAGE) {
+        status.voltage = 5.0;  // Sentinel value for no battery
+        status.hasBattery = false;
+        status.percentage = -1;
+        status.level = -1;
+        status.isUSBPowered = true;  // Must be USB powered if no battery
+        rtcLastUSBState = true;       // Update RTC state for consistency
+        rtcLastVoltage = 0;           // Clear voltage baseline (no valid reading)
+        logMessage(LOG_WARN, "POWER", "No battery detected - assuming USB power", "");
+        return status;
+    }
+
+    // Valid battery detected
+    status.hasBattery = true;
+
+    // Calculate percentage using accurate LiPo discharge curve
+    // Based on MakerFocus 3.7V 2000mAh specs + Adafruit LiPo data
+    if (status.voltage >= 4.2) status.percentage = 100;
+    else if (status.voltage >= 4.1) status.percentage = 95;
+    else if (status.voltage >= 4.0) status.percentage = 85;
+    else if (status.voltage >= 3.9) status.percentage = 75;
+    else if (status.voltage >= 3.8) status.percentage = 60;
+    else if (status.voltage >= 3.7) status.percentage = 50;  // NOMINAL - half capacity
+    else if (status.voltage >= 3.6) status.percentage = 35;
+    else if (status.voltage >= 3.5) status.percentage = 20;
+    else if (status.voltage >= 3.4) status.percentage = 10;  // "Dead" per Adafruit
+    else if (status.voltage >= 3.2) status.percentage = 5;   // Near protection cutoff
+    else status.percentage = 0;
+
+    // Convert to display level (circles: 3=full, 2=medium, 1=low, 0=empty)
+    // More balanced thresholds: 75%/50%/25% boundaries
+    if (status.percentage >= 75) status.level = 3;      // 75-100%
+    else if (status.percentage >= 50) status.level = 2; // 50-74%
+    else if (status.percentage >= 25) status.level = 1; // 25-49%
+    else status.level = 0;                              // 0-24%
+
+    // Calculate average voltage and variance from existing samples (reuse!)
+    float pattern_avg = 0;
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        pattern_avg += voltageSamples[i];
+    }
+    pattern_avg /= ADC_SAMPLE_COUNT;
+
+    float pattern_variance = 0;
+    for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+        float diff = voltageSamples[i] - pattern_avg;
+        pattern_variance += diff * diff;
+    }
+    pattern_variance /= ADC_SAMPLE_COUNT;
+
+    // USB detection using voltage pattern analysis
+    // TP4054 charging IC has no status pins - must detect via voltage behavior
+    bool highVoltage = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD);
+    bool stableVoltage = (pattern_variance < VOLTAGE_STABILITY_THRESHOLD);
+
+    // Static state for timing (non-persistent)
+    static unsigned long lastUSBCheckTime = 0;
+    static bool pendingUSBState = false;
+    static int consecutiveStateCount = 0;
+
+    // Update USB state every 10 seconds, or immediately on first call (initialization)
+    // After deep sleep, static variables reset to 0, so first call initializes state immediately
+    bool isFirstCall = (lastUSBCheckTime == 0);
+
+    // Calculate voltage delta since last check (detects USB plug/unplug events)
+    // WiFi causes 4-16mV sag, USB unplug causes 50-150mV drop (easily distinguishable)
+    // NOTE: Skip delta on first call to prevent false triggers on wake from sleep
+    float voltageDelta = 0;
+    if (!isFirstCall && rtcLastVoltage > 0) {
+        voltageDelta = pattern_avg - rtcLastVoltage;
+    }
+
+    // Pre-calculate voltage zone and delta indicators for logging and logic
+    bool inHysteresisZone = (pattern_avg >= USB_HIGH_VOLTAGE_THRESHOLD && pattern_avg < USB_TO_BATTERY_THRESHOLD);
+    bool clearlyUSB = (pattern_avg >= USB_TO_BATTERY_THRESHOLD);      // ≥4.15V = definitely USB
+    bool clearlyBattery = (pattern_avg < USB_HIGH_VOLTAGE_THRESHOLD);  // <4.05V = definitely battery
+    bool voltageDrop = (!isFirstCall && voltageDelta < -0.05f);   // Dropped >50mV = USB unplugged
+    bool voltageJump = (!isFirstCall && voltageDelta > 0.10f);    // Jumped >100mV = USB plugged in
+
+    if (isFirstCall || (unsigned long)(now - lastUSBCheckTime) >= 10000) {
+        lastUSBCheckTime = now;
+
+        // Determine new USB state using voltage thresholds and delta detection
+        bool newUSBState;
+
+        if (clearlyUSB) {
+            // Above hysteresis zone - definitely USB powered
+            newUSBState = true;
+        } else if (clearlyBattery) {
+            // Below hysteresis zone - definitely battery powered
+            newUSBState = false;
+        } else if (inHysteresisZone) {
+            // In hysteresis zone (4.05-4.15V) - use delta detection + stability
+            if (voltageDrop) {
+                // Detected USB unplug signature (50-150mV drop)
+                newUSBState = false;
+            } else if (voltageJump) {
+                // Detected USB plug-in signature (200-500mV jump)
+                newUSBState = true;
+            } else {
+                // No clear delta - use stability check as fallback
+                // Note: This is less reliable due to ADC noise during WiFi
+                newUSBState = stableVoltage;
+            }
+        } else {
+            // Shouldn't reach here, but default to current state
+            newUSBState = rtcLastUSBState;
+        }
+
+        // On first call (boot/wake), initialize state immediately without confirmation
+        if (isFirstCall) {
+            rtcLastUSBState = newUSBState;
+            pendingUSBState = newUSBState;
+            consecutiveStateCount = 0;
+            rtcLastVoltage = pattern_avg;  // Initialize voltage baseline
+
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "initialized (v=%.2fV, zone=%s)",
+                     pattern_avg, inHysteresisZone ? "HYST" : (clearlyUSB ? "USB" : "BATT"));
+            logMessage(LOG_INFO, "POWER",
+                      newUSBState ? "Initial state: USB mode" : "Initial state: Battery mode",
+                      logBuf);
+        }
+        // Asymmetric confirmation logic: fast plug-in, slow unplug
+        else if (newUSBState == pendingUSBState) {
+            consecutiveStateCount++;
+
+            // Battery → USB: Only 1 confirmation needed (10s total, high confidence signal)
+            // USB → Battery: 2 confirmations needed (20s total, prevents WiFi noise oscillation)
+            int requiredConfirmations = (newUSBState == true) ? 1 : 2;
+
+            if (consecutiveStateCount >= requiredConfirmations) {
+                // State confirmed - update RTC state
+                if (rtcLastUSBState != newUSBState) {
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "confirmed after %d checks (delta=%.3fV, v=%.2fV)",
+                             requiredConfirmations, voltageDelta, pattern_avg);
+                    logMessage(LOG_INFO, "POWER",
+                              newUSBState ? "Switched to USB mode" : "Switched to battery mode",
+                              logBuf);
+                }
+                rtcLastUSBState = newUSBState;
+                consecutiveStateCount = 0;
+            }
+        } else {
+            // State changed - check for high-confidence immediate switch
+            pendingUSBState = newUSBState;
+            consecutiveStateCount = 1;
+
+            // FAST PATH: Immediate switch for clear plug-in events
+            if (newUSBState == true && !rtcLastUSBState) {
+                // Trying to switch to USB - check for high confidence indicators
+                bool largeVoltageIncrease = (voltageDelta > 0.10f);  // Jumped >100mV
+                bool clearlyCharging = (pattern_avg >= 4.15f && stableVoltage);
+
+                if (largeVoltageIncrease || clearlyCharging) {
+                    // High confidence USB connection - switch immediately
+                    rtcLastUSBState = true;
+                    consecutiveStateCount = 0;
+
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf),
+                             "immediate (delta=+%.3fV, v=%.2fV, stable=%s)",
+                             voltageDelta, pattern_avg, stableVoltage ? "yes" : "no");
+                    logMessage(LOG_INFO, "POWER", "USB detected - fast path", logBuf);
+                }
+            }
+        }
+
+        // Update voltage baseline for next delta calculation (skip on first call, already set)
+        if (!isFirstCall) {
+            rtcLastVoltage = pattern_avg;
+        }
+    }
+
+    status.isUSBPowered = rtcLastUSBState;
+
+    // Enhanced diagnostic logging - only log on state change or every 60 seconds (reduces spam)
+    static unsigned long lastBatteryLogTime = 0;
+    static bool lastLoggedUSBState = rtcLastUSBState;
+    bool stateChanged = (rtcLastUSBState != lastLoggedUSBState);
+    bool shouldLog = stateChanged || isFirstCall || ((unsigned long)(now - lastBatteryLogTime) >= 60000);
+
+    if (shouldLog) {
+        lastBatteryLogTime = now;
+        lastLoggedUSBState = rtcLastUSBState;
+
+        char logBuf[256];
+        const char* zoneStr = inHysteresisZone ? "HYST" : (clearlyUSB ? "USB" : "BATT");
+        snprintf(logBuf, sizeof(logBuf),
+                 "v=%.3f avg=%.3f var=%.6f delta=%+.3fV pct=%d%% usb=%s stable=%s zone=%s",
+                 status.voltage, pattern_avg, pattern_variance, voltageDelta,
+                 status.percentage,
+                 status.isUSBPowered ? "Y" : "N",
+                 stableVoltage ? "Y" : "N",
+                 zoneStr);
+        logMessage(LOG_DEBUG, "POWER", "Battery status", logBuf);
+    }
+
+    // Cache result and update timestamp
+    cachedBatteryStatus = status;
+    lastBatteryReadTime = now;
+
+    return status;
+}
+
+// Single-field accessor wrappers for getBatteryStatus()
+// These now benefit from 1-second caching (fast when called multiple times)
+int getBatteryPercentage() { return getBatteryStatus().percentage; }
+int getBatteryLevel() { return getBatteryStatus().level; }
+bool isUSBPowered() { return getBatteryStatus().isUSBPowered; }
+
+/**
+ * Handle critical low battery warning display.
+ * Shows warning screen once per discharge cycle (resets on USB reconnect).
+ * Adds 5-second delay to ensure e-paper refresh completes.
+ *
+ * Should be called when battery drops below LOW_BATTERY_SLEEP_THRESHOLD (15%).
+ * Caller is responsible for entering deep sleep afterward (if sleep_enabled).
+ */
+void handleCriticalLowBatteryWarning() {
+    if (!hasShownLowBatteryWarning) {
+        DisplayManager::showLowBatteryWarning();
+        hasShownLowBatteryWarning = true;
+
+        // Delay to ensure display completes refresh before sleep
+        // E-paper refresh takes ~2 seconds, add buffer for safety
+        delay(5000);  // 5 second delay for display completion
+        logMessage(LOG_INFO, "POWER", "Low battery warning displayed");
+    } else {
+        logMessage(LOG_INFO, "POWER", "Low battery warning already shown, skipping display update");
+    }
+}
+
+// ============================================================================
+// Timezone Management
+// ============================================================================
+
+/**
+ * Fetch timezone from server's GeoIP endpoint
+ * Uses two-factor authentication (X-Device-ID + X-Auth-Token)
+ * No API key needed - uses MaxMind GeoLite2 database on server
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromServer() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Configure HTTPS client
+    WiFiClientSecure secureClient;
+
+    // Skip SSL certificate validation for Cloudflare tunnels (matches OTAManager behavior)
+    // If server uses standard SSL certificate, this still works but is less secure
+    secureClient.setInsecure();
+
+    HTTPClient http;
+    http.setTimeout(10000);  // 10 second timeout (increased from 5s)
+
+    // Build server URL from configuration
+    String protocol = cfg.server.use_ssl ? "https://" : "http://";
+    String url = protocol + cfg.server.host;
+
+    // Add port if non-standard (not 80 for HTTP or 443 for HTTPS)
+    if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+        (!cfg.server.use_ssl && cfg.server.port != 80)) {
+        url += ":" + String(cfg.server.port);
+    }
+
+    // Append timezone lookup endpoint path
+    url += "/api/timezone/lookup";
+
+    // Conditionally add update_db parameter to sync timezone to server
+    // This enables local time display on messages (e.g., "sent at 19:15 EST" vs "sent at 00:15 UTC")
+    if (cfg.timezone.update_server) {
+        url += "?update_db=true";
+    }
+
+    http.begin(secureClient, url);
+
+    // Add two-factor authentication headers (same as WebSocket connection)
+    http.addHeader("X-Device-ID", cfg.device.id);
+    http.addHeader("X-Auth-Token", cfg.security.auth_token);
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "url=%s", url.c_str());
+    logMessage(LOG_INFO, "TIME", "Fetching timezone from server GeoIP", logBuf);
+
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        // Parse JSON response
+        // Server returns IPGeolocation.io-compatible format
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "TIME", "JSON parse error", logBuf);
+            return false;
+        }
+
+        // Extract timezone data
+        // Response format:
+        // {
+        //   "date_time_unix": 1761273385.454,
+        //   "timezone": "America/New_York",
+        //   "timezone_offset": -5,
+        //   "timezone_offset_with_dst": -4,
+        //   "is_dst": true
+        // }
+
+        // API returns a double, extract as double first to preserve precision
+        double timestamp_double = doc["date_time_unix"].as<double>();
+        time_t timestamp = static_cast<time_t>(timestamp_double);
+
+        // Validate timestamp (must be after Jan 1, 2020 and before year 2100)
+        // Jan 1, 2020 = 1577836800
+        // Jan 1, 2100 = 4102444800
+        constexpr time_t MIN_VALID_TIMESTAMP = 1577836800;
+        constexpr time_t MAX_VALID_TIMESTAMP = 4102444800;
+
+        if (timestamp < MIN_VALID_TIMESTAMP || timestamp > MAX_VALID_TIMESTAMP) {
+            snprintf(logBuf, sizeof(logBuf),
+                    "timestamp=%lld (%.3f) out_of_range min=%lld max=%lld",
+                    (long long)timestamp, timestamp_double,
+                    (long long)MIN_VALID_TIMESTAMP, (long long)MAX_VALID_TIMESTAMP);
+            logMessage(LOG_ERROR, "TIME", "Invalid timestamp from API", logBuf);
+            return false;
+        }
+
+        currentTime = timestamp;
+        timezoneOffsetSeconds = doc["timezone_offset_with_dst"].as<int>() * 3600;  // Convert hours to seconds
+        lastTimeSyncTimestamp = currentTime;
+
+        // Set ESP32 system clock to UTC time
+        // This allows the hardware RTC to track time automatically during deep sleep
+        // avoiding manual time estimation errors (especially during quiet hours with extended sleep)
+        struct timeval tv;
+        tv.tv_sec = timestamp;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+
+        const char* tzName = doc["timezone"] | "Unknown";
+        bool isDST = doc["is_dst"] | false;
+
+        // On ESP32, time_t is int64_t (64-bit), must use %lld not %ld to avoid truncation
+        snprintf(logBuf, sizeof(logBuf),
+                "tz=%s offset=%ds unix=%lld dst=%s source=server",
+                tzName,
+                timezoneOffsetSeconds,
+                (long long)currentTime,
+                isDST ? "true" : "false");
+        logMessage(LOG_INFO, "TIME", "Timezone synced successfully", logBuf);
+
+        // Mark that we've successfully synced at least once
+        hasEverSynced = true;
+
+        return true;
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
+        logMessage(LOG_WARN, "TIME", "Server GeoIP request failed", logBuf);
+        http.end();
+        return false;
+    }
+}
+
+/**
+ * Fetch timezone from IPGeolocation.io API
+ * Uses user's API key from config (1000 requests/day free tier)
+ * SSL certificate validation enabled (Mozilla CA bundle)
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromIPGeolocation() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Validate API key is configured
+    if (cfg.timezone.ipgeolocation_api_key.isEmpty()) {
+        logMessage(LOG_ERROR, "TIME", "IPGeolocation API key not configured in config.json");
+        return false;
+    }
+
+    // Configure HTTPS client with Mozilla CA certificate bundle
+    WiFiClientSecure secureClient;
+
+    // Use Mozilla CA certificate bundle for proper SSL validation (IPGeolocation.io uses standard certs)
+    extern const uint8_t rootca_crt_bundle_start[] asm("_binary_certs_x509_crt_bundle_bin_start");
+    extern const uint8_t rootca_crt_bundle_end[] asm("_binary_certs_x509_crt_bundle_bin_end");
+    size_t bundle_size = rootca_crt_bundle_end - rootca_crt_bundle_start;
+    secureClient.setCACertBundle(rootca_crt_bundle_start, bundle_size);
+
+    HTTPClient http;
+    http.setTimeout(10000);  // 10 second timeout
+
+    // Build IPGeolocation.io API URL
+    // NOTE: API key is sent as query parameter (standard practice for this API)
+    // Security: Connection is encrypted with TLS, API key is not logged
+    String url = "https://api.ipgeolocation.io/timezone?apiKey=" + cfg.timezone.ipgeolocation_api_key;
+
+    http.begin(secureClient, url);
+
+    char logBuf[128];
+    // Don't log URL to avoid exposing API key in logs
+    logMessage(LOG_INFO, "TIME", "Fetching timezone from IPGeolocation.io", nullptr);
+
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        // Parse JSON response
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "TIME", "JSON parse error", logBuf);
+            return false;
+        }
+
+        // Extract timezone data
+        // IPGeolocation.io response format:
+        // {
+        //   "date_time_unix": 1761273385.454,
+        //   "timezone": "America/New_York",
+        //   "timezone_offset": -5,
+        //   "timezone_offset_with_dst": -4,
+        //   "is_dst": true
+        // }
+
+        // API returns a double, extract as double first to preserve precision
+        double timestamp_double = doc["date_time_unix"].as<double>();
+        time_t timestamp = static_cast<time_t>(timestamp_double);
+
+        // Validate timestamp (must be after Jan 1, 2020 and before year 2100)
+        constexpr time_t MIN_VALID_TIMESTAMP = 1577836800;
+        constexpr time_t MAX_VALID_TIMESTAMP = 4102444800;
+
+        if (timestamp < MIN_VALID_TIMESTAMP || timestamp > MAX_VALID_TIMESTAMP) {
+            snprintf(logBuf, sizeof(logBuf),
+                    "timestamp=%lld (%.3f) out_of_range min=%lld max=%lld",
+                    (long long)timestamp, timestamp_double,
+                    (long long)MIN_VALID_TIMESTAMP, (long long)MAX_VALID_TIMESTAMP);
+            logMessage(LOG_ERROR, "TIME", "Invalid timestamp from API", logBuf);
+            return false;
+        }
+
+        currentTime = timestamp;
+        timezoneOffsetSeconds = doc["timezone_offset_with_dst"].as<int>() * 3600;  // Convert hours to seconds
+        lastTimeSyncTimestamp = currentTime;
+
+        // Set ESP32 system clock to UTC time
+        struct timeval tv;
+        tv.tv_sec = timestamp;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+
+        const char* tzName = doc["timezone"] | "Unknown";
+        bool isDST = doc["is_dst"] | false;
+
+        snprintf(logBuf, sizeof(logBuf),
+                "tz=%s offset=%ds unix=%lld dst=%s source=ipgeolocation",
+                tzName,
+                timezoneOffsetSeconds,
+                (long long)currentTime,
+                isDST ? "true" : "false");
+        logMessage(LOG_INFO, "TIME", "Timezone synced successfully", logBuf);
+
+        hasEverSynced = true;
+        return true;
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", httpCode);
+        logMessage(LOG_WARN, "TIME", "IPGeolocation.io request failed", logBuf);
+        http.end();
+        return false;
+    }
+}
+
+/**
+ * Fetch timezone information (dispatcher for all timezone sources)
+ * Routes to appropriate function based on config.timezone.source:
+ * - "server": Server-side GeoIP (free, unlimited, requires auth, default)
+ * - "ipgeolocation": IPGeolocation.io API (1000/day free, requires API key)
+ * Returns true if successful, false otherwise
+ */
+bool fetchTimezoneFromAPI() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    String source = cfg.timezone.source;
+    source.toLowerCase();  // Normalize for comparison
+
+    char logBuf[64];
+    snprintf(logBuf, sizeof(logBuf), "source=%s", source.c_str());
+    logMessage(LOG_INFO, "TIME", "Fetching timezone", logBuf);
+
+    if (source == "server") {
+        return fetchTimezoneFromServer();
+    } else if (source == "ipgeolocation") {
+        return fetchTimezoneFromIPGeolocation();
+    } else {
+        // Invalid source - log warning and fall back to server
+        snprintf(logBuf, sizeof(logBuf), "invalid_source=%s fallback=server", source.c_str());
+        logMessage(LOG_WARN, "TIME", "Invalid timezone source", logBuf);
+        return fetchTimezoneFromServer();
+    }
+}
+
+/**
+ * Check if timezone sync is needed
+ * Sync on power-on boot or based on elapsed time (1 hour until first success, then 24 hours)
+ * Uses actual elapsed time from ESP32 RTC to handle variable sleep durations correctly
+ * (e.g., quiet hours with 15-min sleep vs normal 1-min sleep)
+ */
+bool shouldSyncTimezone(bool isPowerOnBoot) {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Always sync on power-on boot
+    if (isPowerOnBoot) {
+        return true;
+    }
+
+    // If time is unknown or never synced, attempt sync now
+    // This handles edge cases where RTC wasn't set properly
+    if (currentTime == 0 || lastTimeSyncTimestamp == 0 || !hasEverSynced) {
+        return true;
+    }
+
+    // Use actual elapsed time to determine if sync is needed
+    time_t elapsedSeconds = currentTime - lastTimeSyncTimestamp;
+    time_t syncIntervalSeconds = cfg.timezone.sync_interval_hours * 3600;  // Default: 24 hours
+
+    return (elapsedSeconds >= syncIntervalSeconds);
+}
+
+/**
+ * Update current time from ESP32 RTC
+ * The ESP32 hardware RTC continues running during deep sleep, providing accurate time
+ * without manual estimation. This eliminates clock drift that occurred with the previous
+ * approach (which added base sleep duration, ignoring quiet hours multipliers).
+ */
+void updateEstimatedTime() {
+    // Read current time from ESP32 system clock (RTC)
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    currentTime = tv.tv_sec;
+
+    // Log the time update with source information
+    char logBuf[80];
+    snprintf(logBuf, sizeof(logBuf), "utc_time=%lld source=ESP32_RTC", (long long)currentTime);
+    logMessage(LOG_DEBUG, "TIME", "Updated time from RTC", logBuf);
+}
+
+// ============================================================================
+// Self-Service Pairing
+// ============================================================================
+// When auth_token is empty, the device enters pairing mode:
+// 1. Requests a pairing code from the server
+// 2. Displays the code on e-paper for the user to enter in Slack
+// 3. Polls the server until the code is claimed or expires
+// 4. On success, saves the auth_token to config.json and returns to normal boot
+
+struct PairingRequestResult {
+    bool success;
+    int httpCode;
+    String sessionId;
+    String pairingCode;
+    int expiresIn;
+    String error;
+};
+
+struct PairingStatusResult {
+    bool success;
+    bool rateLimited;   // Server returned 429 — caller should back off
+    int httpCode;
+    String status;      // "pending", "claimed", "expired"
+    String authToken;   // Present when status == "claimed"
+};
+
+/**
+ * Build the base server URL from config (protocol + host + optional non-default port).
+ * Reusable helper matching the pattern used by timezone, ECDH upload, and OTA.
+ */
+static String buildServerUrl() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    String protocol = cfg.server.use_ssl ? "https://" : "http://";
+    String url = protocol + cfg.server.host;
+    if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+        (!cfg.server.use_ssl && cfg.server.port != 80)) {
+        url += ":" + String(cfg.server.port);
+    }
+    return url;
+}
+
+/**
+ * Determine disconnect reason for user-facing display message.
+ * 3-tier check: WiFi → server /health → assume transient (duplicate rejection, etc.)
+ */
+static String getDisconnectReason() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return "Check WiFi";
+    }
+
+    // WiFi is up — probe server /health to distinguish "server down" from "transient"
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // Matches pairing/OTA/timezone pattern
+
+    HTTPClient http;
+    http.setConnectTimeout(3000);
+    http.setTimeout(3000);
+
+    String url = buildServerUrl() + "/health";
+    if (!http.begin(secureClient, url)) {
+        return "Server Unavailable";
+    }
+
+    int code = http.GET();
+    http.end();
+
+    if (code == 200) {
+        return "Reconnecting...";
+    }
+    return "Server Unavailable";
+}
+
+/**
+ * Request a pairing code from the server.
+ * POST /api/pairing/request?device_id={id}&device_type=esp32_eink&firmware_version={ver}
+ *
+ * Returns PairingRequestResult with session_id and pairing_code on success,
+ * or httpCode/error on failure (403 = not registered, 429 = rate limited).
+ */
+static PairingRequestResult requestPairingCode() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+    PairingRequestResult result = {};
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // Cloudflare tunnel compatibility (matches OTA/timezone pattern)
+
+    HTTPClient http;
+    http.setTimeout(10000);
+
+    String url = buildServerUrl() + "/api/pairing/request";
+    url += "?device_id=" + cfg.device.id;
+    url += "&device_type=esp32_eink";
+#ifdef APP_VERSION
+    url += "&firmware_version=" + String(APP_VERSION);
+#else
+    url += "&firmware_version=unknown";
+#endif
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "url=%s", url.c_str());
+    logMessage(LOG_INFO, "PAIRING", "Requesting pairing code", logBuf);
+
+    http.begin(secureClient, url);
+    http.addHeader("Content-Type", "application/json");
+
+    // POST with empty body (all params are in query string)
+    result.httpCode = http.POST("");
+
+    if (result.httpCode == 200 || result.httpCode == 201) {
+        String response = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "PAIRING", "JSON parse error", logBuf);
+            result.error = "JSON parse error";
+            return result;
+        }
+
+        result.success = true;
+        result.sessionId = doc["session_id"].as<String>();
+        result.pairingCode = doc["pairing_code"].as<String>();
+        result.expiresIn = doc["expires_in"] | 600;
+
+        snprintf(logBuf, sizeof(logBuf), "code=%s session=%s expires=%ds",
+                 result.pairingCode.c_str(),
+                 result.sessionId.substring(0, 8).c_str(),
+                 result.expiresIn);
+        logMessage(LOG_INFO, "PAIRING", "Pairing code received", logBuf);
+    } else {
+        String response = http.getString();
+        http.end();
+
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", result.httpCode);
+        logMessage(LOG_WARN, "PAIRING", "Pairing request failed", logBuf);
+
+        // Try to extract error message from response
+        // Server returns {"error": "..."} for pairing failures (400, 403, 429)
+        JsonDocument doc;
+        if (deserializeJson(doc, response) == DeserializationError::Ok) {
+            result.error = doc["error"].as<String>();
+        }
+        if (result.error.isEmpty()) {
+            result.error = "HTTP " + String(result.httpCode);
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Poll the pairing status for a given session.
+ * GET /api/pairing/status/{session_id}
+ *
+ * Returns PairingStatusResult with status ("pending", "claimed", "expired")
+ * and auth_token when status is "claimed".
+ */
+static PairingStatusResult pollPairingStatus(const String& sessionId) {
+    PairingStatusResult result = {};
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+
+    HTTPClient http;
+    http.setTimeout(10000);
+
+    String url = buildServerUrl() + "/api/pairing/status/" + sessionId;
+
+    http.begin(secureClient, url);
+    result.httpCode = http.GET();
+
+    if (result.httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (error) {
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "PAIRING", "Status JSON parse error", logBuf);
+            return result;
+        }
+
+        result.success = true;
+        result.status = doc["status"].as<String>();
+
+        if (result.status == "claimed" && doc["auth_token"]) {
+            result.authToken = doc["auth_token"].as<String>();
+        }
+
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf), "status=%s", result.status.c_str());
+        logMessage(LOG_DEBUG, "PAIRING", "Poll result", logBuf);
+    } else if (result.httpCode == 429) {
+        http.end();
+        // Server rate limited — caller should increase poll interval
+        result.rateLimited = true;
+        logMessage(LOG_WARN, "PAIRING", "Rate limited by server (429)");
+    } else {
+        http.end();
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf), "http_code=%d", result.httpCode);
+        logMessage(LOG_WARN, "PAIRING", "Status poll failed", logBuf);
+    }
+
+    return result;
+}
+
+/**
+ * Enter self-service pairing mode.
+ * Called from setup() when auth_token is empty. Orchestrates the full flow:
+ * request code → display code → poll until claimed/expired → save auth_token.
+ *
+ * On success: saves auth_token to config.json and returns (setup() continues).
+ * On failure/timeout: shows error message and enters deep sleep (never returns).
+ */
+void enterPairingMode() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Battery vs USB timeout: conserve battery power during interactive pairing
+    const unsigned long PAIRING_TIMEOUT_BATTERY_MS = 120000;   // 2 minutes on battery
+    const unsigned long PAIRING_TIMEOUT_USB_MS = 600000;       // 10 minutes on USB (matches server CODE_TTL)
+    unsigned long pollIntervalMs = 5000;                        // Poll every 5 seconds (mutable for 429 backoff)
+    const int MAX_CODE_RETRIES = 2;                            // Retry with new code up to 2 times on expiry
+
+    bool onBattery = !isUSBPowered();
+    unsigned long timeoutMs = onBattery ? PAIRING_TIMEOUT_BATTERY_MS : PAIRING_TIMEOUT_USB_MS;
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "power=%s timeout=%lums",
+             onBattery ? "battery" : "usb", timeoutMs);
+    logMessage(LOG_INFO, "PAIRING", "Starting pairing mode", logBuf);
+
+    int codeRetries = 0;
+
+    while (codeRetries <= MAX_CODE_RETRIES) {
+        // Step 1: Request a pairing code
+        PairingRequestResult codeResult = requestPairingCode();
+
+        if (!codeResult.success) {
+            if (codeResult.httpCode == 403) {
+                // Device not registered on server
+                logMessage(LOG_WARN, "PAIRING", "Device not registered on server");
+                DisplayManager::showMessage(
+                    "Setup Required",
+                    "Register device on",
+                    "server admin panel",
+                    "ID: " + cfg.device.id.substring(0, 18)
+                );
+                delay(3000);
+                enterDeepSleep(10);  // Sleep 10 minutes and retry
+                return;  // Never reached
+            } else if (codeResult.httpCode == 429) {
+                // Rate limited
+                logMessage(LOG_WARN, "PAIRING", "Rate limited by server");
+                DisplayManager::showMessage(
+                    "Rate Limited",
+                    "Too many attempts",
+                    "Try again later",
+                    ""
+                );
+                delay(3000);
+                enterDeepSleep(10);
+                return;
+            } else {
+                // Network error or unexpected status
+                snprintf(logBuf, sizeof(logBuf), "http=%d error=%s",
+                         codeResult.httpCode, codeResult.error.c_str());
+                logMessage(LOG_WARN, "PAIRING", "Server unreachable or error", logBuf);
+                DisplayManager::showMessage(
+                    "Server Error",
+                    "Cannot reach server",
+                    "Check connection",
+                    ""
+                );
+                delay(3000);
+                enterDeepSleep(5);  // Sleep 5 minutes
+                return;
+            }
+        }
+
+        // Step 2: Display the pairing code
+        DisplayManager::showPairingCode(codeResult.pairingCode, cfg.device.id);
+
+        // Step 3: Poll until claimed, expired, or timeout
+        unsigned long pollStart = millis();
+        int networkErrors = 0;
+        const int MAX_NETWORK_ERRORS = 3;
+
+        while ((millis() - pollStart) < timeoutMs) {
+            delay(pollIntervalMs);
+
+            PairingStatusResult status = pollPairingStatus(codeResult.sessionId);
+
+            if (status.rateLimited) {
+                // Back off: double the poll interval, capped at 30s
+                pollIntervalMs = min(pollIntervalMs * 2, 30000UL);
+                snprintf(logBuf, sizeof(logBuf), "new_interval=%lums", pollIntervalMs);
+                logMessage(LOG_WARN, "PAIRING", "Rate limited, backing off", logBuf);
+                continue;
+            }
+
+            if (!status.success) {
+                networkErrors++;
+                snprintf(logBuf, sizeof(logBuf), "network_errors=%d/%d",
+                         networkErrors, MAX_NETWORK_ERRORS);
+                logMessage(LOG_WARN, "PAIRING", "Poll network error", logBuf);
+                if (networkErrors >= MAX_NETWORK_ERRORS) {
+                    logMessage(LOG_ERROR, "PAIRING", "Too many network errors during polling");
+                    DisplayManager::showDisconnectedScreen("Network error, retrying later...");
+                    delay(3000);
+                    enterDeepSleep(5);
+                    return;
+                }
+                continue;
+            }
+
+            // Reset network error counter on successful poll
+            networkErrors = 0;
+
+            if (status.status == "claimed") {
+                // Pairing successful - save auth_token to config
+                logMessage(LOG_INFO, "PAIRING", "Pairing successful! Saving auth_token");
+
+                AppConfig& mutableCfg = ConfigManager::getMutableConfig();
+                mutableCfg.security.auth_token = status.authToken;
+
+                if (ConfigManager::save()) {
+                    logMessage(LOG_INFO, "PAIRING", "Auth token saved to config.json");
+                } else {
+                    logMessage(LOG_ERROR, "PAIRING", "Failed to save auth token to config.json");
+                    // Continue anyway - token is in memory for this boot session
+                }
+
+                // New pairing = new server-side user record, so the ECDH public
+                // key must be re-uploaded for the server to encrypt messages.
+                SecurityManager::resetKeyUploaded();
+
+                DisplayManager::showMessage(
+                    "Paired!",
+                    "Device linked",
+                    "Starting up...",
+                    ""
+                );
+                delay(2000);
+
+                // SSL/TLS cleanup delay before subsequent HTTPS requests
+                delay(1000);
+                return;  // Return to setup() to continue normal boot
+            }
+
+            if (status.status == "expired") {
+                logMessage(LOG_INFO, "PAIRING", "Pairing code expired");
+                break;  // Break inner poll loop to retry with new code
+            }
+
+            // status == "pending" → continue polling
+        }
+
+        // If we exit the poll loop without claiming, the code expired or we timed out
+        codeRetries++;
+        if (codeRetries <= MAX_CODE_RETRIES) {
+            snprintf(logBuf, sizeof(logBuf), "retry=%d/%d", codeRetries, MAX_CODE_RETRIES);
+            logMessage(LOG_INFO, "PAIRING", "Requesting new pairing code", logBuf);
+        }
+    }
+
+    // Exhausted all retries
+    logMessage(LOG_WARN, "PAIRING", "Pairing timed out after all retries");
+    DisplayManager::showMessage(
+        "Pairing Timeout",
+        "Code expired",
+        "Will retry on wake",
+        ""
+    );
+    delay(3000);
+    enterDeepSleep(5);  // Sleep 5 minutes then retry pairing on next boot
+}
+
+/**
+ * Get current hour in local timezone (0-23)
+ */
+int getCurrentLocalHour() {
+    if (currentTime == 0) {
+        return -1;  // Unknown time
+    }
+
+    time_t localTime = currentTime + timezoneOffsetSeconds;
+    struct tm* timeinfo = gmtime(&localTime);
+
+    // Check for gmtime() failure (unlikely but defensive programming)
+    if (timeinfo == nullptr) {
+        logMessage(LOG_ERROR, "TIME", "gmtime() returned NULL - invalid time value");
+        return -1;
+    }
+
+    return timeinfo->tm_hour;
+}
+
+/**
+ * Check if current time is during quiet hours
+ * Returns true if in quiet hours, false otherwise
+ * Weekends (Saturday/Sunday) are quiet hours all day for battery savings
+ */
+bool isQuietHours() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Check if time is known
+    if (currentTime == 0) {
+        // Time unknown - not in quiet hours (fallback to normal sleep)
+        return false;
+    }
+
+    // Get local time info including day of week
+    time_t localTime = currentTime + timezoneOffsetSeconds;
+    struct tm* timeinfo = gmtime(&localTime);
+
+    // Check for gmtime() failure (defensive programming)
+    if (timeinfo == nullptr) {
+        logMessage(LOG_ERROR, "TIME", "gmtime() failed in isQuietHours()");
+        return false;
+    }
+
+    // Check if it's weekend (Saturday=6 or Sunday=0)
+    // Weekends are quiet hours all day for battery savings (~16% reduction)
+    bool isWeekend = (timeinfo->tm_wday == 0 || timeinfo->tm_wday == 6);
+    if (isWeekend) {
+        return true;  // All day quiet hours on weekends
+    }
+
+    // Weekday: Check night-time quiet hours (e.g., 23:00 - 07:00)
+    int hour = timeinfo->tm_hour;
+
+    // Handle quiet hours that span midnight
+    if (cfg.quiet_hours.start_hour > cfg.quiet_hours.end_hour) {
+        // e.g., 23:00 - 07:00
+        return (hour >= cfg.quiet_hours.start_hour || hour < cfg.quiet_hours.end_hour);
+    } else {
+        // e.g., 01:00 - 05:00 (unusual but supported)
+        return (hour >= cfg.quiet_hours.start_hour && hour < cfg.quiet_hours.end_hour);
+    }
+}
+
+/**
+ * Calculate sleep duration in minutes, applying quiet hours multiplier if needed
+ * Returns the sleep duration in minutes
+ */
+uint32_t calculateSleepDuration() {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Override: WiFi fallback mode uses 60-minute sleep
+    if (wifiPowerState.wifiDisabledMode) {
+        logMessage(LOG_INFO, "POWER", "WiFi fallback mode - using 60-minute sleep");
+        return 60;
+    }
+
+    uint32_t baseSleepMin = cfg.power.sleep_duration_min;
+
+    if (isQuietHours()) {
+        uint32_t quietSleepMin = baseSleepMin * cfg.quiet_hours.sleep_multiplier;
+        char logBuf[64];
+        snprintf(logBuf, sizeof(logBuf),
+                "base=%dmin multiplier=%dx quiet=%dmin",
+                baseSleepMin,
+                cfg.quiet_hours.sleep_multiplier,
+                quietSleepMin);
+        logMessage(LOG_INFO, "POWER", "Quiet hours active - extended sleep", logBuf);
+        return quietSleepMin;
+    } else {
+        return baseSleepMin;
+    }
+}
+
+// ============================================================================
+// Graceful Shutdown Handler
+// ============================================================================
+// Global flags for sleep state management
+static bool enteringSleep = false;      // Set when entering deep sleep
+static bool justWokeFromSleep = false;  // Set on wake, cleared after first connection
+static bool otaCheckedThisBoot = false; // Track if OTA check completed this boot (prevents duplicate checks)
+
+void gracefulShutdown(const char* reason, bool clearDisplay = false) {
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "reason=%s", reason);
+    logMessage(LOG_INFO, "SHUTDOWN", "Starting graceful shutdown", logBuf);
+
+    // Stop accepting new messages
+    wsConnected = false;
+    wsRegistered = false;
+
+    // Disconnect WebSocket cleanly
+    if (WiFi.status() == WL_CONNECTED) {
+        logMessage(LOG_INFO, "SHUTDOWN", "Disconnecting WebSocket");
+        webSocket.disconnect();
+        delay(100);  // Give time for disconnect to complete
+    }
+
+    // Disconnect WiFi
+    if (WiFi.status() == WL_CONNECTED) {
+        logMessage(LOG_INFO, "SHUTDOWN", "Disconnecting WiFi");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+    }
+
+    // Handle display cleanup
+    if (display) {
+        if (clearDisplay) {
+            logMessage(LOG_INFO, "SHUTDOWN", "Clearing display");
+            display->clearScreen();
+            // Update display state after clear (full refresh happened)
+            updateDisplayStateAfterFullRefresh();
+            delay(100);
+        } else if (!enteringSleep) {
+            // Only show shutdown message if NOT entering sleep (preserve reaction display during sleep)
+            logMessage(LOG_INFO, "SHUTDOWN", "Showing shutdown message");
+            DisplayManager::showMessage("System", "Shutting down...", reason, "");
+            // Note: showMessage() already calls updateDisplayStateAfterFullRefresh()
+            delay(100);
+        } else {
+            // Entering sleep - preserve current display state (reaction or previous screen)
+            logMessage(LOG_INFO, "SHUTDOWN", "Preserving display for deep sleep");
+        }
+
+        // Hibernate display to preserve last image and save power
+        logMessage(LOG_INFO, "SHUTDOWN", "Hibernating display");
+        display->hibernate();
+        delay(100);
+    }
+
+    // Cleanup security resources
+    if (SecurityManager::isEnabled()) {
+        logMessage(LOG_INFO, "SHUTDOWN", "Cleaning up security resources");
+        // SecurityManager will clean up automatically on restart
+    }
+
+    logMessage(LOG_INFO, "SHUTDOWN", "Graceful shutdown complete");
+    delay(100);  // Final delay to ensure log messages are transmitted
+}
+
+void enterDeepSleep(uint32_t sleep_minutes) {
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    logMessage(LOG_INFO, "POWER", "Entering deep sleep",
+               String("minutes=" + String(sleep_minutes)).c_str());
+
+    // Set flag to suppress disconnect/shutdown messages
+    enteringSleep = true;
+
+    // Perform graceful shutdown first (this disconnects WebSocket/WiFi)
+    // IMPORTANT: Don't clear display - preserve last reaction on screen during sleep
+    gracefulShutdown("deep_sleep", false);  // clearDisplay=false to preserve display state
+
+    // Display will hibernate and preserve current image (reaction or status message)
+    // E-paper displays retain their image without power - this is the key advantage!
+
+    // Configure wake up timer (0 = indefinite sleep, button-only wake)
+    if (sleep_minutes > 0) {
+        uint64_t sleep_time_us = sleep_minutes * 60 * 1000000ULL;
+        esp_sleep_enable_timer_wakeup(sleep_time_us);
+    }
+
+    // Configure wake up on GPIO 39 button press (active LOW)
+    // GPIO 39 is the built-in button on LilyGo T5 V2.3
+    // The button pulls the pin LOW when pressed
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);  // Wake when GPIO 39 goes LOW
+
+    // Enter deep sleep
+    const char* wakeSources = sleep_minutes > 0 ? "wake_sources=timer,button_gpio39" : "wake_sources=button_gpio39_only";
+    logMessage(LOG_INFO, "POWER", "Entering deep sleep now", wakeSources);
+    delay(50);
+    esp_deep_sleep_start();
+}
+
+// ============================================================================
+// WebSocket Event Handler - Using modern C++ features
+// ============================================================================
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED: {
+            logMessage(LOG_WARN, "WS", "Disconnected");
+            wsConnected = false;
+            wsRegistered = false;
+            metrics.failedConnections++;
+            ResilienceManager::markConnectionLost();  // Track connection loss
+
+            // Show disconnect message ONCE after 10 failed attempts (not on every subsequent disconnect)
+            // This prevents repeated e-paper refreshes that drain battery and are visually disruptive
+            // After the initial warning, preserve the "Connection Lost" display until reconnected
+            if (!enteringSleep && metrics.failedConnections == 10) {
+                displayShowingConnectionLost = true;
+                DisplayManager::showDisconnectedScreen(getDisconnectReason());
+            }
+            break;
+        }
+
+        case WStype_CONNECTED: {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "url=%s", reinterpret_cast<char*>(payload));
+            logMessage(LOG_INFO, "WS", "Connected (transport)", logBuf);
+            wsConnected = true;
+            wsRegistered = false;  // Wait for server "registered" confirmation
+            lastHeartbeat = millis();  // Initialize heartbeat timer on connection
+            metrics.totalConnections++;
+            metrics.failedConnections = 0;  // Reset failed counter on successful connection
+            registrationErrorCount = 0;  // Reset registration error tracking on successful connection
+            registrationFailedPermanently = false;
+
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            // Send registration message with auth_token (mandatory two-factor auth)
+            // ECDH public key is uploaded separately via /upload endpoint (not in registration)
+            // Server will respond with {"type":"registered"} on success, completing the
+            // two-phase handshake. Display updates and OTA checks are deferred until then.
+            JsonDocument regDoc;
+            regDoc["type"] = "register";
+            regDoc["device_type"] = "esp32_eink";
+            regDoc["auth_token"] = cfg.security.auth_token;
+
+            String regMsg;
+            serializeJson(regDoc, regMsg);
+            webSocket.sendTXT(regMsg);
+            logMessage(LOG_INFO, "WS", "Sent registration with auth_token");
+            break;
+        }
+
+        case WStype_TEXT: {
+            handleWebSocketMessage(payload, length);
+            break;
+        }
+
+        case WStype_ERROR: {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "error=%s", reinterpret_cast<char*>(payload));
+            logMessage(LOG_ERROR, "WS", "Error occurred", logBuf);
+            break;
+        }
+
+        case WStype_PING:
+        case WStype_PONG:
+            logMessage(LOG_DEBUG, "WS", "Ping/Pong");
+            break;
+
+        default:
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "type=%d", type);
+            logMessage(LOG_WARN, "WS", "Unhandled event", logBuf);
+            break;
+    }
+}
+
+// ============================================================================
+// Message Processing - Separated for clarity
+// ============================================================================
+void handleWebSocketMessage(const uint8_t* payload, size_t length) {
+    char logBuf[256];
+    snprintf(logBuf, sizeof(logBuf), "len=%d", length);
+    logMessage(LOG_DEBUG, "WS", "Message received", logBuf);
+
+    // Update last message time for any received message
+    lastHeartbeat = millis();
+
+    JsonDocument doc;
+
+    // Try to parse as JSON first (both ECDH envelopes and plain messages are JSON)
+    String message((const char*)payload, length);
+
+    // Detect ECDH encrypted envelope: JSON with "ephemeral_public_key" field
+    if (SecurityManager::isEnabled() && message.indexOf("ephemeral_public_key") > 0) {
+        logMessage(LOG_DEBUG, "SECURITY", "Received ECDH encrypted message");
+
+        // Decrypt the ECDH envelope (JSON → ECDH + HKDF + AES-256-GCM → plaintext JSON)
+        String decrypted = SecurityManager::decryptECDH(message);
+        if (decrypted.isEmpty()) {
+            logMessage(LOG_ERROR, "SECURITY", "Failed to decrypt ECDH message");
+            return;
+        }
+
+        logMessage(LOG_DEBUG, "SECURITY", "ECDH message decrypted successfully");
+
+        // Parse decrypted JSON
+        DeserializationError error = deserializeJson(doc, decrypted);
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "JSON", "Parse error in decrypted data", logBuf);
+            return;
+        }
+    } else {
+        // Parse as unencrypted JSON
+        DeserializationError error = deserializeJson(doc, payload, length);
+        if (error) {
+            snprintf(logBuf, sizeof(logBuf), "error=%s", error.c_str());
+            logMessage(LOG_ERROR, "JSON", "Parse error", logBuf);
+            return;
+        }
+    }
+
+    // Process the message content
+    const char* msgType = doc["type"];
+    if (!msgType) {
+        logMessage(LOG_WARN, "WS", "Message missing type field");
+        return;
+    }
+
+    // Use string comparison with early returns for efficiency
+
+    // Server confirms authentication — two-phase handshake complete.
+    // Display updates and OTA checks are deferred until this point so
+    // we know the server accepted us as a valid, authenticated device.
+    if (strcmp(msgType, "registered") == 0) {
+        logMessage(LOG_INFO, "WS", "Registration confirmed by server");
+        wsRegistered = true;
+        ResilienceManager::markConnectionRestored();
+        ResilienceManager::recordHeartbeat();
+
+        // Check for firmware updates on first registration after power-on boot.
+        // DNS has stabilized by now (WebSocket + registration round-trip succeeded).
+        if (!otaCheckedThisBoot && !justWokeFromSleep) {
+            otaCheckedThisBoot = true;
+            logMessage(LOG_INFO, "OTA", "First connection established - checking for firmware updates");
+            // Jitter boot OTA check to avoid thundering herd after mass power-on.
+            // Only applied when fleet jitter is enabled; single B2C devices skip the delay.
+            const AppConfig& jitterCfg = ConfigManager::getConfig();
+            if (jitterCfg.server.reconnect_jitter_max_sec > 0) {
+                uint32_t ota_jitter_ms = esp_random() % 60000;
+                char jitterBuf[32];
+                snprintf(jitterBuf, sizeof(jitterBuf), "jitter_ms=%lu", (unsigned long)ota_jitter_ms);
+                logMessage(LOG_INFO, "OTA", "Boot OTA check delayed", jitterBuf);
+                delay(ota_jitter_ms);
+            }
+            checkForFirmwareUpdate();
+            lastOTACheckMillis = millis();
+        }
+
+        // Update display based on what was showing before reconnection.
+        // Save justWokeFromSleep before clearing — the wake block already did a full
+        // display refresh, so we skip showConnectedScreen() to avoid a double refresh
+        // that wastes ~4.3s on DEPG displays (the most impactful battery mode fix).
+        bool wasJustWoken = justWokeFromSleep;
+        justWokeFromSleep = false;
+
+        if (displayShowingConnectionLost && lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+            // "Connection Lost" was displayed over the last content — restore it
+            displayShowingConnectionLost = false;
+            logMessage(LOG_INFO, "WS", "Reconnected - restoring last display content");
+            restoreLastDisplay();
+        } else if (lastDisplay.contentType == DISPLAY_CONTENT_NONE && !wasJustWoken) {
+            // First-ever connection AND not waking from sleep (wake block already refreshed).
+            // Show the "waiting for reactions" screen since this is the initial connection.
+            displayShowingConnectionLost = false;
+            DisplayManager::showConnectedScreen(SecurityManager::isEnabled());
+            hasShownBlankScreen = true;
+        } else {
+            // Normal reconnect OR wake-from-sleep — preserve current display.
+            logMessage(LOG_INFO, "WS", "Connected - preserving display");
+        }
+        return;
+    }
+
+    if (strcmp(msgType, "heartbeat") == 0) {
+        metrics.heartbeatsReceived++;
+        ResilienceManager::recordHeartbeat();  // Track for health monitoring
+        logMessage(LOG_DEBUG, "WS", "Heartbeat received");
+        return;
+    }
+
+    if (strcmp(msgType, "reaction") == 0) {
+        metrics.messagesReceived++;
+        logMessage(LOG_INFO, "WS", "Reaction received");
+
+        // Extract message ID for ACK
+        const char* messageId = doc["message_id"];
+
+        // Display the reaction
+        JsonObject reaction = doc.as<JsonObject>();
+        DisplayManager::showReaction(reaction);
+        lastReactionTime = millis();  // Track for idle detection
+
+        // Send ACK back to server
+        if (messageId && wsConnected) {
+            JsonDocument ackDoc;
+            ackDoc["type"] = "ack";
+            ackDoc["id"] = messageId;
+
+            String ackJson;
+            serializeJson(ackDoc, ackJson);
+            webSocket.sendTXT(ackJson);
+
+            snprintf(logBuf, sizeof(logBuf), "id=%s", messageId);
+            logMessage(LOG_DEBUG, "WS", "ACK sent", logBuf);
+        } else if (!messageId) {
+            logMessage(LOG_WARN, "WS", "Message missing message_id field");
+        }
+
+        return;
+    }
+
+    if (strcmp(msgType, "broadcast") == 0) {
+        metrics.messagesReceived++;
+        logMessage(LOG_INFO, "WS", "Broadcast received");
+
+        const char* messageId = doc["message_id"];
+        JsonObject broadcast = doc.as<JsonObject>();
+        DisplayManager::showBroadcast(broadcast);
+        lastReactionTime = millis();
+
+        // Send ACK back to server
+        if (messageId && wsConnected) {
+            JsonDocument ackDoc;
+            ackDoc["type"] = "ack";
+            ackDoc["id"] = messageId;
+            String ackJson;
+            serializeJson(ackDoc, ackJson);
+            webSocket.sendTXT(ackJson);
+
+            snprintf(logBuf, sizeof(logBuf), "id=%s", messageId);
+            logMessage(LOG_DEBUG, "WS", "ACK sent", logBuf);
+        }
+        return;
+    }
+
+    if (strcmp(msgType, "firmware_update") == 0) {
+        logMessage(LOG_INFO, "OTA", "Firmware update notification received");
+        const char* version = doc["version"];
+        bool required = doc["required"] | false;
+
+        if (required) {
+            logMessage(LOG_WARN, "OTA", "Required update - installing immediately");
+            performOTAUpdate();
+        } else {
+            logMessage(LOG_INFO, "OTA", "Optional update - will install when idle");
+            pendingUpdate = true;
+            pendingVersion = String(version ? version : "");
+        }
+        return;
+    }
+
+    if (strcmp(msgType, "error") == 0) {
+        const char* errorCode = doc["code"] | "";
+        const char* errorMsg = doc["message"] | "Unknown error";
+        const char* deviceId = doc["device_id"] | "";
+
+        snprintf(logBuf, sizeof(logBuf), "code=%s message=\"%s\"", errorCode, errorMsg);
+        logMessage(LOG_ERROR, "WS", "Server error", logBuf);
+
+        // Handle DEVICE_NOT_LINKED — device has credentials but no user is linked.
+        // Enter pairing mode so the user can link via the pairing modal.
+        // Tracks attempts to prevent infinite loop on battery: after MAX attempts,
+        // show a help screen and deep sleep so the user can manually intervene.
+        if (strcmp(errorCode, "DEVICE_NOT_LINKED") == 0) {
+            deviceNotLinkedCount++;
+
+            if (deviceNotLinkedCount > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
+                logMessage(LOG_WARN, "WS", "Too many DEVICE_NOT_LINKED errors - sleeping");
+                DisplayManager::showMessage("Pairing needed", "Hold button 3-9 sec",
+                                          "to re-enter pairing", "");
+                delay(5000);
+                enterDeepSleep(15);  // 15-minute sleep; button press wakes immediately
+                return;
+            }
+
+            logMessage(LOG_INFO, "WS", "Device not linked - entering pairing mode");
+            wsConnected = false;
+            wsRegistered = false;
+            webSocket.disconnect();
+
+            // enterPairingMode() blocks until pairing succeeds or fails.
+            // On success it returns normally; on failure/timeout it calls
+            // enterDeepSleep() and never returns to this point.
+            enterPairingMode();
+
+            // Pairing completed — restart to reconnect with new credentials
+            // (same pattern as button hold re-pair at handleButtonHold)
+            logMessage(LOG_INFO, "WS", "Pairing complete - restarting");
+            ESP.restart();
+            return;
+        }
+
+        // Handle TRIAL_EXPIRED — 7-day trial has ended, user needs to purchase activation key
+        // Server sends purchase_url where user can buy a key using their device_id
+        if (strcmp(errorCode, "TRIAL_EXPIRED") == 0) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            // Extract purchase URL from server response (fallback to hardcoded default)
+            const char* purchaseUrl = doc["purchase_url"] | "";
+            String id = deviceId[0] ? String(deviceId) : cfg.device.id;
+
+            if (purchaseUrl[0] != '\0') {
+                // Append device_id as query param so checkout auto-links to this device
+                // e.g., "https://pebl.ink/checkout?device_id=a1b2c3d4e5f6"
+                String fullUrl = String(purchaseUrl);
+                fullUrl += (fullUrl.indexOf('?') >= 0) ? "&" : "?";
+                fullUrl += "device_id=" + id;
+
+                // Show QR code for easy scanning (falls back to text if URL too long)
+                DisplayManager::showPurchaseQRCode(fullUrl, id);
+            } else {
+                DisplayManager::showMessage("Trial Expired", "Purchase key at:", "See purchase info", String("ID: ") + id);
+            }
+
+            // Trial expiry is not transient — user must purchase a key before device works again
+            registrationFailedPermanently = true;
+            wsConnected = false;
+            wsRegistered = false;
+            webSocket.disconnect();
+
+            logMessage(LOG_INFO, "WS", "Trial expired - entering 60-minute deep sleep",
+                       (String("device_id=") + id).c_str());
+
+            // Deep sleep for 60 minutes (longer than 10-min error sleep since trial expiry isn't transient)
+            // On wake: counter resets, device retries. If user purchased key, connection succeeds.
+            delay(2000);  // Show message for 2 seconds before sleeping
+            enterDeepSleep(60);  // 60 minutes
+            // Never returns from deep sleep
+        }
+
+        // Handle DEVICE_NOT_REGISTERED (device credentials not found on server)
+        // This is different from DEVICE_NOT_LINKED - credentials exist but no user associated
+        if (strcmp(errorCode, "DEVICE_NOT_REGISTERED") == 0) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            registrationErrorCount++;
+
+            if (registrationErrorCount < MAX_REGISTRATION_RETRIES) {
+                // Attempts 1-2: Show retry screen with counter (1 of 2, 2 of 2)
+                String line1 = "Connecting...";
+                String line2 = String("Attempt ") + registrationErrorCount + " of 2";
+                String line3 = String("ID: ") + (deviceId[0] ? deviceId : cfg.device.id.c_str());
+                String line4 = "Checking registration";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                delay(30000);  // 30 seconds between retries
+            } else {
+                // Attempt 3: Show "restart device" screen (no attempt counter)
+                String line1 = "Setup Required";
+                String line2 = String("ID: ") + (deviceId[0] ? deviceId : cfg.device.id.c_str());
+                String line3 = "Complete registration";
+                String line4 = "then RESTART device";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                // Mark registration as permanently failed (stop reconnecting)
+                registrationFailedPermanently = true;
+                wsConnected = false;
+                wsRegistered = false;
+                webSocket.disconnect();
+
+                // Deep sleep for 10 minutes, then wake to check again
+                // Counter will reset on wake (not RTC), so gets fresh 3 attempts
+                delay(2000);  // Show message for 2 seconds before sleeping
+                enterDeepSleep(10);  // 10 minutes (parameter is in minutes, not microseconds)
+                // Never returns from deep sleep
+            }
+        } else if (strcmp(errorCode, "INVALID_AUTH_TOKEN") == 0 || strcmp(errorCode, "AUTH_FAILED") == 0) {
+            // Handle authentication failures - config error, not transient
+            const AppConfig& cfg = ConfigManager::getConfig();
+
+            registrationErrorCount++;
+
+            if (registrationErrorCount < MAX_REGISTRATION_RETRIES) {
+                // Attempts 1-2: Show retry screen (in case of transient issue)
+                String line1 = "Auth Failed";
+                String line2 = String("Attempt ") + registrationErrorCount + " of 2";
+                String line3 = "Check auth_token";
+                String line4 = "in config.json";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                delay(30000);  // 30 seconds between retries
+            } else {
+                // Attempt 3: Show permanent error screen - this is a config issue
+                String line1 = "Auth Token Invalid";
+                String line2 = "Fix config.json:";
+                String line3 = "security.auth_token";
+                String line4 = "then RESTART device";
+                DisplayManager::showMessage(line1, line2, line3, line4);
+
+                // Mark registration as permanently failed (stop reconnecting)
+                registrationFailedPermanently = true;
+                wsConnected = false;
+                wsRegistered = false;
+                webSocket.disconnect();
+
+                // Deep sleep for 10 minutes, then wake to check again
+                // Counter will reset on wake (not RTC), so gets fresh 3 attempts
+                delay(2000);  // Show message for 2 seconds before sleeping
+                enterDeepSleep(10);  // 10 minutes (parameter is in minutes, not microseconds)
+                // Never returns from deep sleep
+            }
+        } else {
+            // Generic error screen
+            DisplayManager::showMessage("Error:", errorMsg);
+        }
+        return;
+    }
+
+    snprintf(logBuf, sizeof(logBuf), "type=%s", msgType);
+    logMessage(LOG_WARN, "WS", "Unknown message type", logBuf);
+}
+
+// ============================================================================
+// Test Command Processing
+// ============================================================================
+#ifdef ENABLE_DEBUG_FEATURES
+void processSerialCommand(const String& command) {
+    logMessage(LOG_TEST, "CMD", command.c_str());
+
+    if (command.startsWith("TEST:WIFI")) {
+        if (WiFi.status() == WL_CONNECTED) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "ip=%s rssi=%d",
+                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            logMessage(LOG_TEST, "WIFI", "Connected", buf);
+        } else {
+            const char* status = "unknown";
+            switch(WiFi.status()) {
+                case WL_NO_SHIELD: status = "no_shield"; break;
+                case WL_IDLE_STATUS: status = "idle"; break;
+                case WL_NO_SSID_AVAIL: status = "no_ssid"; break;
+                case WL_SCAN_COMPLETED: status = "scan_completed"; break;
+                case WL_CONNECT_FAILED: status = "connect_failed"; break;
+                case WL_CONNECTION_LOST: status = "connection_lost"; break;
+                case WL_DISCONNECTED: status = "disconnected"; break;
+            }
+            char buf[64];
+            snprintf(buf, sizeof(buf), "status=%s", status);
+            logMessage(LOG_TEST, "WIFI", "Not connected", buf);
+        }
+    }
+    else if (command.startsWith("TEST:WS")) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "connected=%s registered=%s device_id=%s",
+                 wsConnected ? "true" : "false",
+                 wsRegistered ? "true" : "false",
+                 ConfigManager::getConfig().device.id.c_str());
+        logMessage(LOG_TEST, "WS", "Status", buf);
+    }
+    else if (command.startsWith("TEST:MSG:")) {
+        String json = command.substring(9);
+        logMessage(LOG_TEST, "MSG", "Injecting message");
+        injectTestMessage(json);
+    }
+    else if (command.startsWith("TEST:DISPLAY:")) {
+        String text = command.substring(13);
+        if (text.startsWith("emoji:")) {
+            String emoji = text.substring(6);
+            JsonDocument doc;
+            doc["type"] = "reaction";
+            doc["emoji"] = emoji;
+            doc["user"] = "TestUser";
+            doc["channel"] = "test-channel";
+            doc["message"] = "Test message";
+            doc["encrypted"] = false;
+            DisplayManager::showReaction(doc.as<JsonObject>());
+        } else {
+            DisplayManager::showMessage(text, "Line 2", "Line 3", "Line 4");
+        }
+    }
+    else if (command == "TEST:CONFIG") {
+        logMessage(LOG_TEST, "CONFIG", "Current configuration:");
+
+        if (ConfigManager::isLoaded()) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+            char buf[256];
+
+            snprintf(buf, sizeof(buf), "id=%s name=%s",
+                     cfg.device.id.c_str(), cfg.device.name.c_str());
+            logMessage(LOG_TEST, "CONFIG", "Device", buf);
+
+            snprintf(buf, sizeof(buf), "timeout=%lu force_high=%s",
+                     cfg.wifi.timeout_ms, cfg.wifi.force_high_power ? "true" : "false");
+            logMessage(LOG_TEST, "CONFIG", "WiFi", buf);
+
+            snprintf(buf, sizeof(buf), "host=%s port=%d ssl=%s",
+                     cfg.server.host.c_str(), cfg.server.port, cfg.server.use_ssl ? "true" : "false");
+            logMessage(LOG_TEST, "CONFIG", "Server", buf);
+
+            snprintf(buf, sizeof(buf), "rotation=%d", cfg.display.rotation);
+            logMessage(LOG_TEST, "CONFIG", "Display", buf);
+        } else {
+            logMessage(LOG_TEST, "CONFIG", "Configuration not loaded!");
+        }
+    }
+    else if (command.startsWith("TEST:CONFIG:SET:")) {
+        String remainder = command.substring(16);
+        int colonPos = remainder.indexOf(':');
+        if (colonPos > 0) {
+            String key = remainder.substring(0, colonPos);
+            String value = remainder.substring(colonPos + 1);
+
+            AppConfig& cfg = ConfigManager::getMutableConfig();
+            bool updated = false;
+
+            if (key == "device.id") {
+                cfg.device.id = value;
+                updated = true;
+            } else if (key == "device.name") {
+                cfg.device.name = value;
+                updated = true;
+            } else if (key == "server.host") {
+                cfg.server.host = value;
+                updated = true;
+            } else if (key == "security.encryption") {
+                cfg.security.encryption = value;
+                updated = true;
+            }
+
+            if (updated) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "key=%s value=%s", key.c_str(), value.c_str());
+                logMessage(LOG_TEST, "CONFIG", "Updated", buf);
+            } else {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "key=%s", key.c_str());
+                logMessage(LOG_TEST, "CONFIG", "Unknown key", buf);
+            }
+        }
+    }
+    else if (command.startsWith("TEST:CONFIG:SAVE")) {
+        if (ConfigManager::save()) {
+            logMessage(LOG_TEST, "CONFIG", "Configuration saved to LittleFS");
+
+            File f = LittleFS.open("/config.json", "r");
+            if (f) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "size=%d bytes", f.size());
+                logMessage(LOG_TEST, "CONFIG", "Config file created", buf);
+                f.close();
+            }
+        } else {
+            logMessage(LOG_ERROR, "CONFIG", "Failed to save configuration");
+        }
+    }
+    else if (command.startsWith("TEST:CONFIG:RELOAD")) {
+        if (ConfigManager::load()) {
+            const AppConfig& cfg = ConfigManager::getConfig();
+            char buf[256];
+            snprintf(buf, sizeof(buf), "device_id=%s server=%s:%d",
+                     cfg.device.id.c_str(), cfg.server.host.c_str(), cfg.server.port);
+            logMessage(LOG_TEST, "CONFIG", "Configuration reloaded", buf);
+        } else {
+            logMessage(LOG_ERROR, "CONFIG", "Failed to reload configuration");
+        }
+    }
+    else if (command.startsWith("TEST:ECDH:STATUS")) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "enabled=%s key_uploaded=%s",
+                 SecurityManager::isEnabled() ? "true" : "false",
+                 SecurityManager::isKeyUploaded() ? "true" : "false");
+        logMessage(LOG_TEST, "ECDH", "Status", buf);
+
+        if (SecurityManager::isEnabled()) {
+            String pem = SecurityManager::getPublicKeyPEM();
+            if (!pem.isEmpty()) {
+                logMessage(LOG_TEST, "ECDH", "Public key PEM:");
+                logMessage(LOG_TEST, "ECDH", pem.c_str());
+            }
+        }
+    }
+    else if (command.startsWith("TEST:RESILIENCE")) {
+        String status = ResilienceManager::getHealthStatus();
+        logMessage(LOG_TEST, "RESILIENCE", "Status", status.c_str());
+
+        char buf[256];
+        snprintf(buf, sizeof(buf), "healthy=%s queue_size=%zu heartbeat_timeout=%lums",
+                 ResilienceManager::isConnectionHealthy() ? "true" : "false",
+                 ResilienceManager::getQueueSize(),
+                 ResilienceManager::getTimeSinceLastHeartbeat());
+        logMessage(LOG_TEST, "RESILIENCE", "Health", buf);
+    }
+    else if (command.startsWith("TEST:QUEUE:")) {
+        String json = command.substring(11);
+        if (ResilienceManager::queueMessage(json)) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "queue_size=%zu", ResilienceManager::getQueueSize());
+            logMessage(LOG_TEST, "RESILIENCE", "Message queued", buf);
+        } else {
+            logMessage(LOG_ERROR, "RESILIENCE", "Failed to queue message");
+        }
+    }
+    else if (command == "TEST:QUEUE:PROCESS") {
+        if (ResilienceManager::hasQueuedMessages()) {
+            bool processed = ResilienceManager::processQueuedMessages();
+            logMessage(LOG_TEST, "RESILIENCE", processed ? "Queue processed" : "Queue processing failed");
+        } else {
+            logMessage(LOG_TEST, "RESILIENCE", "Queue empty");
+        }
+    }
+    else if (command == "TEST:HEARTBEAT:TIMEOUT") {
+        logMessage(LOG_TEST, "RESILIENCE", "Simulating heartbeat timeout");
+    }
+    else if (command.startsWith("TEST:METRICS")) {
+        uint32_t uptime = (millis() - metrics.startTime) / 1000;
+        float successRate = metrics.totalConnections > 0 ?
+                           (float)(metrics.totalConnections - metrics.failedConnections) / metrics.totalConnections : 0;
+
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "uptime_s=%lu connections=%lu failed=%lu messages=%lu heartbeats=%lu success_rate=%.2f",
+                 uptime, metrics.totalConnections, metrics.failedConnections,
+                 metrics.messagesReceived, metrics.heartbeatsReceived, successRate);
+        logMessage(LOG_TEST, "METRICS", "Stats", buf);
+    }
+    else if (command.startsWith("LOG:LEVEL:")) {
+        String level = command.substring(10);
+        if (level == "ERROR") currentLogLevel = LOG_ERROR;
+        else if (level == "WARN") currentLogLevel = LOG_WARN;
+        else if (level == "INFO") currentLogLevel = LOG_INFO;
+        else if (level == "DEBUG") currentLogLevel = LOG_DEBUG;
+        else if (level == "TEST") currentLogLevel = LOG_TEST;
+
+        char buf[32];
+        snprintf(buf, sizeof(buf), "level=%d", currentLogLevel);
+        logMessage(LOG_INFO, "LOG", "Level changed", buf);
+    }
+    else if (command == "TEST:SHUTDOWN") {
+        logMessage(LOG_TEST, "SHUTDOWN", "Testing graceful shutdown");
+        gracefulShutdown("test_command", false);
+        logMessage(LOG_TEST, "SHUTDOWN", "Graceful shutdown complete - device will restart in 3s");
+        delay(3000);
+        ESP.restart();
+    }
+    else if (command == "TEST:SHUTDOWN:CLEAR") {
+        logMessage(LOG_TEST, "SHUTDOWN", "Testing graceful shutdown with clear display");
+        gracefulShutdown("test_command_clear", true);
+        logMessage(LOG_TEST, "SHUTDOWN", "Graceful shutdown complete - device will restart in 3s");
+        delay(3000);
+        ESP.restart();
+    }
+    else if (command == "TEST:LOCK:ICONS") {
+        logMessage(LOG_TEST, "DISPLAY", "Testing lock icons");
+        display->setFullWindow();
+        display->firstPage();
+        do {
+            display->fillScreen(GxEPD_WHITE);
+            display->setTextColor(GxEPD_BLACK);
+            display->setFont(&FreeSans9pt7b);
+
+            DisplayManager::drawBatteryIndicator();
+
+            DisplayManager::drawLockIcon(5, 5);
+            display->setCursor(30, 20);
+            display->print("Locked");
+
+            DisplayManager::drawUnlockIcon(5, 40);
+            display->setCursor(30, 55);
+            display->print("Unlocked");
+
+            DisplayManager::drawLockIcon(5, 75);
+            DisplayManager::drawUnlockIcon(30, 75);
+            display->setCursor(60, 90);
+            display->print("Comparison");
+
+        } while (display->nextPage());
+        logMessage(LOG_TEST, "DISPLAY", "Lock icons displayed");
+    }
+    else {
+        logMessage(LOG_WARN, "CMD", "Unknown command", command.c_str());
+    }
+}
+
+void injectTestMessage(const String& jsonPayload) {
+    handleWebSocketMessage((uint8_t*)jsonPayload.c_str(), jsonPayload.length());
+}
+#endif
+
+// ============================================================================
+// Network Management
+// ============================================================================
+class SlackNetworkManager {
+public:
+    static bool connectWiFi(bool silent = false) {
+        const AppConfig& cfg = ConfigManager::getConfig();
+        char logBuf[128];
+
+        // Check WiFi fallback mode (low-power mode after repeated failures)
+        if (wifiPowerState.wifiDisabledMode) {
+            wifiPowerState.fallbackWakeCount++;
+
+            // Retry every 6 hours (6 wakes at 60-min sleep = 6 hours)
+            if (wifiPowerState.fallbackWakeCount >= 6) {
+                // Reset and retry
+                wifiPowerState.wifiDisabledMode = false;
+                wifiPowerState.fallbackWakeCount = 0;
+                wifiPowerState.currentPower = WIFI_POWER_11dBm;  // Reset to LOW
+                wifiPowerState.consecutiveFailures = 0;
+                wifiPowerState.totalFailedWakes = 0;
+                logMessage(LOG_INFO, "WIFI", "Exiting fallback mode - resetting to LOW power");
+            } else {
+                // Still in fallback - skip WiFi attempt
+                snprintf(logBuf, sizeof(logBuf), "wake_count=%d/6 next_retry_in=%dh",
+                         wifiPowerState.fallbackWakeCount, 6 - wifiPowerState.fallbackWakeCount);
+                logMessage(LOG_INFO, "WIFI", "In fallback mode - skipping WiFi", logBuf);
+                return false;
+            }
+        }
+
+        // Initialize WiFi credential manager (loads from NVS + merges config.json seeds)
+        if (!WiFiCredentialManager::begin()) {
+            logMessage(LOG_WARN, "WIFI", "Credential manager initialization issue (may be first boot)");
+        }
+
+        // Check if we have any WiFi credentials
+        if (WiFiCredentialManager::getNetworkCount() == 0) {
+            logMessage(LOG_INFO, "WIFI", "No WiFi credentials stored - entering provisioning mode");
+            if (!silent) {
+                DisplayManager::showMessage("WiFi Setup", "No networks saved", "", "Starting portal...");
+            }
+            return startProvisioning();
+        }
+
+        // Populate WiFiMulti with all stored credentials
+        // WiFiMulti automatically connects to the strongest available network
+        wifiMulti = WiFiMulti();  // Reset to clear any previous networks
+        for (const auto& cred : WiFiCredentialManager::getCredentials()) {
+            wifiMulti.addAP(cred.ssid.c_str(), cred.password.c_str());
+            snprintf(logBuf, sizeof(logBuf), "ssid=%s pinned=%s",
+                     cred.ssid.c_str(), cred.isPinned ? "yes" : "no");
+            logMessage(LOG_DEBUG, "WIFI", "Added network to WiFiMulti", logBuf);
+        }
+
+        snprintf(logBuf, sizeof(logBuf), "networks=%d", WiFiCredentialManager::getNetworkCount());
+        logMessage(LOG_INFO, "WIFI", "WiFi credentials loaded", logBuf);
+
+        // Try connecting 3 times before entering provisioning mode
+        const int maxRetries = 3;
+        const uint32_t retryDelay = 5000;  // 5 seconds between retries
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            snprintf(logBuf, sizeof(logBuf), "attempt=%d/%d", attempt, maxRetries);
+            logMessage(LOG_INFO, "WIFI", "Connecting", logBuf);
+
+            WiFi.mode(WIFI_STA);
+
+            // Set network hostname using device.name from config (RFC 1123 compliant)
+            // Always append 4-char device ID hash to ensure uniqueness across multiple devices
+            // Example: "Slack Reactions Display" -> "slack-reactions-display-a1b2"
+            // Fallback: "slack-reactions-device-{hash}" if device.name is empty/invalid
+            String deviceHash = generateDeviceHash(cfg.device.id);
+            String hashedFallback = "slack-reactions-device-" + deviceHash;
+
+            String hostnameWithHash = cfg.device.name.isEmpty()
+                ? hashedFallback
+                : cfg.device.name + "-" + deviceHash;
+            String hostname = sanitizeHostname(hostnameWithHash, hashedFallback);
+
+            WiFi.setHostname(hostname.c_str());
+            snprintf(logBuf, sizeof(logBuf), "hostname=%s (from: %s)",
+                     hostname.c_str(), cfg.device.name.c_str());
+            logMessage(LOG_DEBUG, "WIFI", "Hostname configured", logBuf);
+
+            // Apply TX power: force HIGH or use adaptive (LOW → MEDIUM → HIGH)
+            wifi_power_t txPower = wifiPowerState.currentPower;
+            const char* powerName = "UNKNOWN";
+
+            if (cfg.wifi.force_high_power) {
+                // Force HIGH power mode (disables adaptive escalation)
+                txPower = WIFI_POWER_19_5dBm;
+                powerName = "HIGH (forced)";
+            } else {
+                // Use adaptive power from RTC memory (starts at LOW, auto-escalates on failures)
+                if (txPower == WIFI_POWER_11dBm) {
+                    powerName = "LOW";
+                } else if (txPower == WIFI_POWER_15dBm) {
+                    powerName = "MEDIUM";
+                } else {
+                    powerName = "HIGH";
+                }
+            }
+
+            // Set TX power BEFORE connection attempt for adaptive power savings
+            // Must be set after WiFi.mode(WIFI_STA) but before wifiMulti.run()
+            WiFi.setTxPower(txPower);
+            snprintf(logBuf, sizeof(logBuf), "tx_power=%s", powerName);
+            logMessage(LOG_DEBUG, "WIFI", "Setting TX power", logBuf);
+
+            // WiFiMulti.run() tries all configured networks and connects to strongest signal
+            // It handles scanning, selection, and connection internally
+            uint8_t status = wifiMulti.run(cfg.wifi.timeout_ms);
+
+            // Check if connected
+            if (status == WL_CONNECTED) {
+                int rssi = WiFi.RSSI();
+                String connectedSSID = WiFi.SSID();
+                snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s rssi=%d tx_power=%s",
+                         WiFi.localIP().toString().c_str(), connectedSSID.c_str(), rssi, powerName);
+                logMessage(LOG_INFO, "WIFI", "Connected", logBuf);
+
+                // Update lastUsed timestamp for LRU tracking
+                WiFiCredentialManager::updateLastUsed(connectedSSID);
+
+                // Reset adaptive power failures on successful connection (unless forced HIGH)
+                if (!cfg.wifi.force_high_power) {
+                    wifiPowerState.consecutiveFailures = 0;
+                    wifiPowerState.totalFailedWakes = 0;
+                    // Keep current power level (sticky behavior)
+                }
+
+                // Give DNS servers time to be ready (prevents early OTA check failures)
+                delay(2000);
+
+                return true;
+            }
+
+            // Failed attempt - handle adaptive power escalation (only if not forcing HIGH)
+            if (!cfg.wifi.force_high_power) {
+                wifiPowerState.consecutiveFailures++;
+                wifiPowerState.totalFailedWakes++;
+
+                // Check for power escalation
+                if (wifiPowerState.consecutiveFailures >= cfg.wifi.escalation_threshold) {
+                    if (wifiPowerState.currentPower == WIFI_POWER_11dBm) {
+                        // Escalate LOW → MEDIUM
+                        wifiPowerState.currentPower = WIFI_POWER_15dBm;
+                        wifiPowerState.consecutiveFailures = 0;
+                        logMessage(LOG_WARN, "WIFI", "Connection failed 3 times at LOW, escalating to MEDIUM power");
+                    } else if (wifiPowerState.currentPower == WIFI_POWER_15dBm) {
+                        // Escalate MEDIUM → HIGH
+                        wifiPowerState.currentPower = WIFI_POWER_19_5dBm;
+                        wifiPowerState.consecutiveFailures = 0;
+                        logMessage(LOG_WARN, "WIFI", "Connection failed 3 times at MEDIUM, escalating to HIGH power");
+                    } else {
+                        // Already at HIGH - can't escalate further
+                        logMessage(LOG_ERROR, "WIFI", "Connection failed at HIGH power - not a TX power issue");
+                    }
+                }
+
+                // Check for fallback mode entry
+                if (wifiPowerState.totalFailedWakes >= cfg.wifi.max_failed_wakes) {
+                    wifiPowerState.wifiDisabledMode = true;
+                    wifiPowerState.fallbackWakeCount = 0;
+                    snprintf(logBuf, sizeof(logBuf), "total_failures=%d threshold=%d",
+                             wifiPowerState.totalFailedWakes, cfg.wifi.max_failed_wakes);
+                    logMessage(LOG_ERROR, "WIFI", "Entering low-power fallback mode (60min sleep, retry in 6h)", logBuf);
+                    return false;  // Don't continue retrying in this wake cycle
+                }
+            }
+
+            // Wait before retry (unless it's the last attempt)
+            if (attempt < maxRetries) {
+                snprintf(logBuf, sizeof(logBuf), "retry_in=%dms", retryDelay);
+                logMessage(LOG_WARN, "WIFI", "Retrying", logBuf);
+                if (!silent) {
+                    DisplayManager::showMessage("Connection failed", "Retrying...");
+                }
+                delay(retryDelay);
+            }
+        }
+
+        // All retries failed - enter provisioning mode
+        logMessage(LOG_ERROR, "WIFI", "All connection attempts failed, entering provisioning mode");
+        if (!silent) {
+            DisplayManager::showMessage("WiFi Setup", "Starting portal...");
+        }
+        return startProvisioning();
+    }
+
+    /**
+     * Validate device ID format for security
+     * - Must be 3-64 characters
+     * - Only alphanumeric, underscore, hyphen allowed
+     */
+    static bool validateDeviceId(const String& id) {
+        if (id.length() < 3 || id.length() > 64) return false;
+
+        for (size_t i = 0; i < id.length(); i++) {
+            char c = id.charAt(i);
+            if (!isalnum(c) && c != '_' && c != '-') return false;
+        }
+        return true;
+    }
+
+    /**
+     * Generate a short 4-character hash from device ID for privacy-safe hostname fallback
+     *
+     * Creates a stable, deterministic hash using simple checksum algorithm (no crypto imports).
+     * The hash is consistent across reboots for the same device.id.
+     *
+     * Algorithm:
+     * - Compute 32-bit hash using polynomial rolling hash (multiplier: 31)
+     * - Convert to base-36 (0-9, a-z) for compact representation
+     * - Pad to 4 characters for consistency
+     *
+     * Example: "lilygo_t5_v231_213_1" → "a3f2"
+     *
+     * @param deviceId The device.id string to hash
+     * @return 4-character alphanumeric hash string
+     */
+    static String generateDeviceHash(const String& deviceId) {
+        uint32_t hash = 0;
+        for (size_t i = 0; i < deviceId.length(); i++) {
+            hash = hash * 31 + deviceId.charAt(i);
+        }
+        // Convert to base-36 (0-9, a-z) for short string
+        // 36^4 = 1,679,616 possible combinations (sufficient for collision resistance)
+        String result = String(hash % 1679616, 36);
+
+        // Pad to exactly 4 characters
+        while (result.length() < 4) {
+            result = "0" + result;
+        }
+        return result;
+    }
+
+    /**
+     * Sanitize hostname to comply with RFC 1123 DNS naming conventions
+     *
+     * RFC 1123 Rules:
+     * - Valid characters: a-z, A-Z, 0-9, hyphen (-)
+     * - Must start and end with alphanumeric (not hyphen)
+     * - Maximum length: 63 characters
+     * - Case-insensitive (converted to lowercase for consistency)
+     *
+     * Sanitization Process:
+     * 1. Convert to lowercase
+     * 2. Replace spaces and underscores with hyphens
+     * 3. Remove invalid characters (keep only alphanumeric and hyphens)
+     * 4. Truncate to 63 characters
+     * 5. Remove leading/trailing hyphens
+     * 6. Collapse consecutive hyphens into single hyphen
+     * 7. Fallback to provided fallback string if result is empty/invalid
+     *
+     * @param name Original hostname to sanitize (from config.device.name)
+     * @param fallback Fallback hostname if sanitization produces invalid result
+     * @return RFC 1123 compliant hostname string
+     */
+    static String sanitizeHostname(const String& name, const String& fallback) {
+        String result = name;
+
+        // Step 1: Convert to lowercase
+        result.toLowerCase();
+
+        // Step 2 & 3: Replace spaces/underscores with hyphens, remove invalid chars
+        String cleaned = "";
+        for (size_t i = 0; i < result.length(); i++) {
+            char c = result.charAt(i);
+            if (isalnum(c)) {
+                cleaned += c;
+            } else if (c == ' ' || c == '_' || c == '-') {
+                cleaned += '-';
+            }
+            // All other characters are silently removed
+        }
+        result = cleaned;
+
+        // Step 4: Truncate to 63 characters max
+        if (result.length() > 63) {
+            result = result.substring(0, 63);
+        }
+
+        // Step 5: Remove leading hyphens
+        while (result.length() > 0 && result.charAt(0) == '-') {
+            result = result.substring(1);
+        }
+
+        // Remove trailing hyphens
+        while (result.length() > 0 && result.charAt(result.length() - 1) == '-') {
+            result = result.substring(0, result.length() - 1);
+        }
+
+        // Step 6: Collapse consecutive hyphens
+        String collapsed = "";
+        bool lastWasHyphen = false;
+        for (size_t i = 0; i < result.length(); i++) {
+            char c = result.charAt(i);
+            if (c == '-') {
+                if (!lastWasHyphen) {
+                    collapsed += c;
+                    lastWasHyphen = true;
+                }
+                // Skip consecutive hyphens
+            } else {
+                collapsed += c;
+                lastWasHyphen = false;
+            }
+        }
+        result = collapsed;
+
+        // Step 7: Validate result is non-empty and starts/ends with alphanumeric
+        if (result.length() == 0 ||
+            !isalnum(result.charAt(0)) ||
+            !isalnum(result.charAt(result.length() - 1))) {
+            // Use fallback if result is invalid (recursive sanitization with ultimate fallback)
+            return sanitizeHostname(fallback, "slack-reactions-device");
+        }
+
+        return result;
+    }
+
+    static bool startProvisioning(bool forcePortal = false) {
+        logMessage(LOG_INFO, "WIFI", "Starting WiFi provisioning mode");
+
+        // Validate that config is loaded before proceeding
+        if (!ConfigManager::isLoaded()) {
+            logMessage(LOG_ERROR, "CONFIG", "Config not loaded - cannot start provisioning");
+            ESP.restart();
+            return false;  // Never reached, but explicit
+        }
+
+        WiFiManager wm;
+
+        // Load current config to pre-fill Device ID field
+        const AppConfig& cfg = ConfigManager::getConfig();
+
+        // Create buffer for device ID (WiFiManagerParameter needs char array, not String)
+        static char device_id_buffer[65];  // 64 chars + null terminator
+        strncpy(device_id_buffer, cfg.device.id.c_str(), sizeof(device_id_buffer) - 1);
+        device_id_buffer[sizeof(device_id_buffer) - 1] = '\0';  // Ensure null termination
+
+        // Create custom parameter with current device ID as default/editable value
+        WiFiManagerParameter custom_device_id(
+            "device_id",                    // Parameter ID
+            "Device ID",                    // Label shown in form
+            device_id_buffer,               // Current value (pre-filled, user can edit)
+            64                              // Max length
+        );
+
+        // Add informational HTML text above the field
+        WiFiManagerParameter custom_html_text(
+            "<p><small>&#9888; Device ID is auto-generated from hardware. "
+            "Changing it will require re-registering with your admin and re-pairing.</small></p>"
+        );
+
+        // Add parameters to WiFiManager (will appear in portal)
+        wm.addParameter(&custom_html_text);
+        wm.addParameter(&custom_device_id);
+
+        // Portal branding and styling to match PEBL website design language.
+        // Colors: warm cream bg (#faf8f4), dark charcoal buttons (#1c1c1e),
+        // secondary text (#6b6560), subtle borders (#eee8df).
+        // Fonts fall back to system sans-serif since Google Fonts won't load
+        // on the local AP (no internet connectivity during provisioning).
+        wm.setTitle("pebl");
+        wm.setCustomHeadElement(
+            "<style>"
+            "body{background:#faf8f4;color:#1c1c1e;"
+                "font-family:-apple-system,system-ui,sans-serif;}"
+            "h1{font-size:1.6rem;letter-spacing:2px;margin-bottom:0;}"
+            "h3{color:#6b6560;font-weight:400;font-size:0.95rem;margin-top:4px;}"
+            "a{color:#1c1c1e;}"
+            "a:hover{color:#6b6560;}"
+            "button,input[type='submit']{background:#1c1c1e;color:#faf8f4;"
+                "border-radius:10px;border:0;line-height:2.6rem;font-size:1rem;"
+                "font-weight:600;transition:opacity 0.2s;}"
+            "button:hover{opacity:0.85;}"
+            "button.D{background:#c2410c;}"
+            "input,select{border:1px solid #eee8df;border-radius:10px;"
+                "padding:10px 12px;font-size:1rem;background:#fff;}"
+            "input:focus{border-color:#1c1c1e;outline:none;}"
+            "label{color:#6b6560;font-size:0.85rem;}"
+            ".msg{border-color:#eee8df;border-radius:10px;background:#fff;}"
+            ".msg.S{border-left-color:#4ade80;}"
+            ".msg.S h4{color:#4ade80;}"
+            ".msg.D{border-left-color:#c2410c;}"
+            ".msg.D h4{color:#c2410c;}"
+            "hr{border:none;border-top:1px solid #eee8df;}"
+            ".btn-outline{background:#faf8f4;color:#1c1c1e;"
+                "border:1px solid #eee8df !important;}"
+            ".btn-outline:hover{border-color:#1c1c1e !important;}"
+            "</style>"
+        );
+
+        // Configure portal menu with "Clear Saved Networks" button.
+        // Uses outline style (btn-outline) to visually separate it as a secondary action.
+        const char* menuItems[] = {"wifi", "wifinoscan", "info", "custom", "sep", "restart", "exit"};
+        wm.setMenu(menuItems, 7);
+        wm.setCustomMenuHTML(
+            "<form action='/clear-networks' method='post'>"
+            "<button class='btn-outline'>Clear Saved Networks</button></form><br/>"
+        );
+
+        // Flag to track if we should save custom parameters
+        bool shouldSaveConfig = false;
+
+        // Set custom AP name
+        const char* apName = "pebl-setup";
+
+        // Configure callback to show provisioning UI on e-paper (QR code screen)
+        wm.setAPCallback([](WiFiManager* myWM) {
+            logMessage(LOG_INFO, "WIFI", "Entered provisioning mode - showing QR code");
+            String ssid = myWM->getConfigPortalSSID();
+            String ip = WiFi.softAPIP().toString();
+            DisplayManager::showProvisioningMode(ssid, ip);  // Shows QR code screen
+        });
+
+        // Configure callback when WiFi credentials/params are saved
+        wm.setSaveConfigCallback([&shouldSaveConfig]() {
+            shouldSaveConfig = true;
+            logMessage(LOG_INFO, "WIFI", "Configuration save callback triggered");
+            DisplayManager::showMessage("Config Saved!", "Processing...");
+        });
+
+        // Bind custom route for clearing saved WiFi networks from NVS.
+        // Accessible from the portal menu — independent of WiFi configuration.
+        wm.setWebServerCallback([&wm]() {
+            wm.server->on("/clear-networks", HTTP_POST, [&wm]() {
+                WiFiCredentialManager::begin();
+                WiFiCredentialManager::clearNVS();
+                logMessage(LOG_INFO, "WIFI", "Saved networks cleared via portal");
+                wm.server->send(200, "text/html",
+                    "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<style>body{background:#faf8f4;color:#1c1c1e;"
+                    "font-family:-apple-system,system-ui,sans-serif;"
+                    "text-align:center;padding:40px 20px;}"
+                    "h2{font-size:1.4rem;margin-bottom:8px;}"
+                    "p{color:#6b6560;font-size:0.95rem;}"
+                    "a{display:inline-block;margin-top:16px;background:#1c1c1e;"
+                    "color:#faf8f4;padding:10px 28px;border-radius:10px;"
+                    "text-decoration:none;font-weight:600;}"
+                    "a:hover{opacity:0.85;}</style></head>"
+                    "<body><h2>Networks Cleared</h2>"
+                    "<p>All saved WiFi networks have been removed.</p>"
+                    "<p>Seed networks from config will reload on next boot.</p>"
+                    "<a href='/'>Back</a></body></html>");
+            });
+        });
+
+        // Set timeout for config portal (10 minutes)
+        wm.setConfigPortalTimeout(600);
+
+        // Choose connection method based on context
+        bool success;
+        if (forcePortal) {
+            // Manual config mode (long press) - force portal even if WiFi works
+            logMessage(LOG_INFO, "WIFI", "Forcing config portal (disconnecting WiFi first)");
+            WiFi.disconnect();  // Disconnect from current WiFi to enable AP mode
+            success = wm.startConfigPortal(apName);  // Force portal to open
+        } else {
+            // Auto-triggered mode (no WiFi) - try to connect or open portal
+            logMessage(LOG_INFO, "WIFI", "Auto-connect mode");
+            success = wm.autoConnect(apName);
+        }
+
+        // Process results
+        if (success) {
+            // Check if we should process custom parameter changes
+            if (shouldSaveConfig) {
+                // Get the new device ID value from form (with nullptr safety)
+                const char* rawValue = custom_device_id.getValue();
+                String newDeviceId = rawValue ? String(rawValue) : String("");
+                newDeviceId.trim();  // Remove leading/trailing whitespace
+
+                // Only update if changed and non-empty
+                if (newDeviceId.length() > 0 && newDeviceId != cfg.device.id) {
+                    if (validateDeviceId(newDeviceId)) {
+                        // CRITICAL: Save old ID before modifying config (cfg references same object)
+                        String oldDeviceId = cfg.device.id;
+
+                        // Update config in memory
+                        AppConfig& mutableCfg = ConfigManager::getMutableConfig();
+                        mutableCfg.device.id = newDeviceId;
+
+                        // Save to LittleFS
+                        if (ConfigManager::save()) {
+                            // Log the change
+                            char logBuf[128];
+                            snprintf(logBuf, sizeof(logBuf), "old_id=%s new_id=%s",
+                                     oldDeviceId.c_str(), newDeviceId.c_str());
+                            logMessage(LOG_INFO, "CONFIG", "Device ID updated via portal", logBuf);
+
+                            // Truncate device IDs for display (max ~18 chars to fit with prefix)
+                            String oldIdShort = oldDeviceId;
+                            String newIdShort = newDeviceId;
+
+                            if (oldIdShort.length() > 18) {
+                                oldIdShort = oldIdShort.substring(0, 15) + "...";
+                            }
+                            if (newIdShort.length() > 18) {
+                                newIdShort = newIdShort.substring(0, 15) + "...";
+                            }
+
+                            // Show success message (4 lines, properly truncated)
+                            DisplayManager::showMessage(
+                                "ID Changed!",              // Line 1: ~11 chars
+                                "Old: " + oldIdShort,       // Line 2: max 23 chars
+                                "New: " + newIdShort,       // Line 3: max 23 chars
+                                "Restarting..."             // Line 4: ~13 chars
+                            );
+                            delay(3000);
+                        } else {
+                            logMessage(LOG_ERROR, "CONFIG", "Failed to save config file");
+                            DisplayManager::showMessage("Save Failed!", "Using old ID", "", "Restarting...");
+                            delay(2000);
+                        }
+                    } else {
+                        // Invalid format
+                        logMessage(LOG_WARN, "CONFIG", "Invalid device ID format", newDeviceId.c_str());
+                        DisplayManager::showMessage(
+                            "Invalid ID Format!",
+                            "Must be 3-64 chars",
+                            "alphanumeric/_/- only",
+                            "Using old ID"
+                        );
+                        delay(3000);
+                    }
+                } else {
+                    // Device ID unchanged
+                    logMessage(LOG_INFO, "CONFIG", "Device ID unchanged");
+                }
+            }
+
+            // WiFi connection successful - capture and store credentials for multi-network support
+            String newSSID = WiFi.SSID();
+            String newPass = wm.getWiFiPass();
+
+            // Initialize credential manager if not already done (in case this is first boot)
+            WiFiCredentialManager::begin();
+
+            // Add/update the network in credential storage
+            if (WiFiCredentialManager::addNetwork(newSSID, newPass)) {
+                char credBuf[64];
+                snprintf(credBuf, sizeof(credBuf), "ssid=%s stored=yes", newSSID.c_str());
+                logMessage(LOG_INFO, "WIFI", "Network credentials saved", credBuf);
+            } else {
+                // This can happen if all 5 slots are pinned (seed networks)
+                char credBuf[64];
+                snprintf(credBuf, sizeof(credBuf), "ssid=%s stored=no (all slots pinned)", newSSID.c_str());
+                logMessage(LOG_WARN, "WIFI", "Network works but not persisted", credBuf);
+            }
+
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "ip=%s ssid=%s",
+                     WiFi.localIP().toString().c_str(), newSSID.c_str());
+            logMessage(LOG_INFO, "WIFI", "Provisioned and connected", logBuf);
+
+            DisplayManager::showMessage("WiFi Connected!",
+                                       WiFi.localIP().toString(),
+                                       "",
+                                       "Restarting...");
+            delay(2000);
+            ESP.restart();
+            return true;
+
+        } else {
+            // Timeout or user cancelled - enter deep sleep to save battery
+            // User must power cycle to retry provisioning
+            logMessage(LOG_ERROR, "WIFI", "Provisioning timeout - entering deep sleep");
+            DisplayManager::showMessage(
+                "WiFi Setup Timeout",
+                "Turn off device",
+                "and back on",
+                "to try again"
+            );
+            delay(3000);  // Give user time to read message
+
+            // Hibernate display to preserve message and reduce power draw
+            if (display) {
+                display->hibernate();
+            }
+
+            esp_deep_sleep_start();  // Sleep indefinitely (no wake timer)
+            return false;  // Never reached
+        }
+    }
+
+    static void connectWebSocket() {
+        const AppConfig& cfg = ConfigManager::getConfig();
+        char logBuf[256];
+        snprintf(logBuf, sizeof(logBuf), "server=%s:%d device_id=%s",
+                 cfg.server.host.c_str(), cfg.server.port, cfg.device.id.c_str());
+        logMessage(LOG_INFO, "WS", "Connecting", logBuf);
+
+        // Build WebSocket path with device_id and display_variant
+        String path = cfg.server.path + "?device_id=";
+        path += cfg.device.id;
+
+        // Add display_variant if configured (for OTA firmware tracking)
+        if (!cfg.device.display_variant.isEmpty()) {
+            path += "&display_variant=";
+            path += cfg.device.display_variant;
+        }
+
+        // Use beginSSL for secure WebSocket connection if configured
+        if (cfg.server.use_ssl) {
+            webSocket.beginSSL(cfg.server.host.c_str(), cfg.server.port, path);
+        } else {
+            webSocket.begin(cfg.server.host.c_str(), cfg.server.port, path);
+        }
+
+        webSocket.onEvent(webSocketEvent);
+
+        // Disable library auto-reconnect (manual handling) and internal heartbeat (conflicts with server heartbeats)
+        webSocket.setReconnectInterval(0);
+
+        // Update reconnect delay
+        reconnectDelay = ConnectionTiming::WS_INITIAL_RECONNECT_MS;
+    }
+
+    static void handleReconnection() {
+        if (WiFi.status() != WL_CONNECTED) {
+            handleWiFiReconnection();
+        } else {
+            handleWebSocketReconnection();
+            // Removed client-side heartbeat timeout checking
+            // Let server and WebSocket library handle connection health
+            // checkHeartbeatTimeout();
+        }
+    }
+
+private:
+    static void handleWiFiReconnection() {
+        const uint32_t now = millis();
+        // WiFi reconnect interval: 30 seconds
+        constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 30000;
+        if (now - lastWiFiReconnect > WIFI_RECONNECT_INTERVAL_MS) {
+            lastWiFiReconnect = now;
+            logMessage(LOG_WARN, "WIFI", "Reconnecting");
+            WiFi.reconnect();
+        }
+    }
+
+    static void handleWebSocketReconnection() {
+        const AppConfig& cfg = ConfigManager::getConfig();
+
+        // Don't reconnect if registration permanently failed
+        if (registrationFailedPermanently) {
+            return;
+        }
+
+        if (!wsConnected) {
+            const uint32_t now = millis();
+            if (now - lastReconnect > reconnectDelay) {
+                lastReconnect = now;
+
+                // Ensure we're fully disconnected before attempting reconnection
+                // This prevents duplicate connections
+                webSocket.disconnect();
+                delay(100);  // Small delay to ensure disconnect completes
+
+                char logBuf[64];
+                snprintf(logBuf, sizeof(logBuf), "delay_ms=%lu", reconnectDelay);
+                logMessage(LOG_INFO, "WS", "Reconnection attempt", logBuf);
+                connectWebSocket();
+
+                // Exponential backoff with maximum
+                reconnectDelay = min(reconnectDelay * 2, ConnectionTiming::WS_MAX_RECONNECT_MS);
+            }
+        } else {
+            // Reset reconnect delay on successful connection
+            reconnectDelay = ConnectionTiming::WS_INITIAL_RECONNECT_MS;
+        }
+    }
+
+    static void checkHeartbeatTimeout() {
+        const AppConfig& cfg = ConfigManager::getConfig();
+        // Only check heartbeat timeout after server confirms registration —
+        // before that, we haven't completed the two-phase handshake and
+        // shouldn't trigger reconnects based on missing heartbeats.
+        if (wsRegistered && lastHeartbeat > 0) {
+            uint32_t timeSinceHeartbeat = (unsigned long)(millis() - lastHeartbeat);
+            // Only disconnect if we haven't received ANY messages (not just heartbeats) for double the timeout
+            // The WebSocketsClient has its own ping/pong mechanism that should keep the connection alive
+            if (timeSinceHeartbeat > (ConnectionTiming::HEARTBEAT_TIMEOUT_MS * 2)) {
+                char logBuf[64];
+                snprintf(logBuf, sizeof(logBuf), "last_seen_ms=%lu", timeSinceHeartbeat);
+                logMessage(LOG_WARN, "WS", "Connection appears stale, forcing reconnect", logBuf);
+
+                // Force reconnection
+                wsConnected = false;
+                wsRegistered = false;
+                webSocket.disconnect();
+                lastHeartbeat = 0;
+            } else if (timeSinceHeartbeat > ConnectionTiming::HEARTBEAT_TIMEOUT_MS) {
+                // Just log a warning but don't disconnect yet
+                char logBuf[64];
+                snprintf(logBuf, sizeof(logBuf), "last_heartbeat_ms=%lu", timeSinceHeartbeat);
+                logMessage(LOG_DEBUG, "WS", "No heartbeat received", logBuf);
+            }
+        }
+    }
+};
+
+// ============================================================================
+// Button Hold Handler — shared by deep sleep wake and main loop
+// ============================================================================
+// Handles tiered button press on GPIO 39 (boot button):
+//   3-9 seconds:  Enter pairing mode for multi-platform linking
+//   10+ seconds:  Enter WiFi provisioning portal
+//
+// When needsInit=true (deep sleep wake), loads config and initializes display.
+// When needsInit=false (main loop), config and display are already set up.
+void handleButtonHold(bool needsInit) {
+    uint32_t pressStart = millis();
+    bool showedFeedback = false;
+
+    // Measure how long button is held (up to 17s max detection)
+    while (digitalRead(GPIO_NUM_39) == LOW && (millis() - pressStart) < 17000) {
+        // At 3s mark: show visual feedback so user knows what will happen on release
+        if (!showedFeedback && (millis() - pressStart) >= 3000) {
+            if (needsInit) {
+                ConfigManager::begin();
+                if (!ConfigManager::load()) {
+                    break;
+                }
+                initializeDisplayHardware();
+            }
+            showedFeedback = true;
+            DisplayManager::showMessage("Release: Add Platform", "Keep holding 15s: WiFi Setup");
+        }
+        delay(50);
+    }
+
+    uint32_t pressDuration = millis() - pressStart;
+
+    if (pressDuration >= 15000) {
+        // 15+ seconds = WiFi provisioning (existing behavior)
+        logMessage(LOG_INFO, "CONFIG", "Extra-long press detected - entering forced config mode");
+
+        if (needsInit && !showedFeedback) {
+            ConfigManager::begin();
+            if (!ConfigManager::load()) {
+                logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                ESP.restart();
+                return;
+            }
+            initializeDisplayHardware();
+        }
+
+        // startProvisioning() calls ESP.restart(), so no return needed
+        SlackNetworkManager::startProvisioning(true);
+
+    } else if (pressDuration >= 3000) {
+        // 3-9 seconds = Enter pairing mode to add another platform
+        logMessage(LOG_INFO, "CONFIG", "Medium press detected - entering pairing mode");
+
+        if (needsInit && !showedFeedback) {
+            ConfigManager::begin();
+            if (!ConfigManager::load()) {
+                logMessage(LOG_ERROR, "CONFIG", "Failed to load config - restarting");
+                ESP.restart();
+                return;
+            }
+            initializeDisplayHardware();
+        }
+
+        const AppConfig& btnCfg = ConfigManager::getConfig();
+
+        if (btnCfg.security.auth_token.length() > 0) {
+            logMessage(LOG_INFO, "CONFIG", "Re-entering pairing mode for platform linking");
+
+            enterPairingMode();
+
+            // Pairing completed — restart to reconnect with all linked platforms
+            ESP.restart();
+        } else {
+            logMessage(LOG_WARN, "CONFIG", "Cannot enter pairing mode - device not paired yet");
+            DisplayManager::showMessage("Not paired yet", "Complete initial setup first");
+            delay(5000);
+        }
+    }
+}
+
+// ============================================================================
+// Arduino Setup Function
+// ============================================================================
+// ============================================================
+// E-INK PIN SCANNER v5 — electrical characterization
+// Results are buffered into g_scanReport and replayed over serial every 5 s
+// forever, so capture timing doesn't matter.
+// ============================================================
+static String g_scanReport;
+static void scanLog(const char* fmt, ...) {
+    char buf[160];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_scanReport += buf;
+    Serial.print(buf);
+    Serial.flush();
+}
+
+#include "soc/gpio_reg.h"
+static inline uint64_t gpioReadAll() {
+    return ((uint64_t)REG_READ(GPIO_IN1_REG) << 32) | (uint64_t)REG_READ(GPIO_IN_REG);
+}
+
+struct EinkMap { int8_t busy, rst, dc, cs, sclk, mosi; };
+
+static EinkMap g_maps[] = {
+    { 8, 18, 17, 16, 15,  7},   // A: reverse consecutive pads
+    { 7, 15, 16, 17, 18,  8},   // B: forward consecutive pads
+    {18, 17, 16, 15,  7,  6},   // C: UC8151-style (busy idles high)
+    {16, 15,  7,  6,  5,  4},   // D: shifted window
+};
+static const int N_MAPS = sizeof(g_maps)/sizeof(g_maps[0]);
+
+static uint8_t s_sclk, s_mosi, s_dc, s_cs;
+
+static void e7Byte(uint8_t b) {
+    for (int k = 7; k >= 0; k--) {
+        digitalWrite(s_mosi, (b >> k) & 1);
+        delayMicroseconds(3);          // settle MOSI before clock
+        digitalWrite(s_sclk, HIGH);
+        delayMicroseconds(3);          // hold clock high so panel samples
+        digitalWrite(s_sclk, LOW);
+        delayMicroseconds(3);
+    }
+}
+static void e7Cmd(uint8_t c) {
+    digitalWrite(s_dc, LOW);
+    if (s_cs != 0xFF) digitalWrite(s_cs, LOW);
+    e7Byte(c);
+    if (s_cs != 0xFF) digitalWrite(s_cs, HIGH);
+    digitalWrite(s_dc, HIGH);
+}
+static void e7Data(uint8_t d) {
+    if (s_cs != 0xFF) digitalWrite(s_cs, LOW);
+    e7Byte(d);
+    if (s_cs != 0xFF) digitalWrite(s_cs, HIGH);
+}
+
+static void einkPinScan() {
+    // v36: reproduce the known-good WILL render + check black fill in same frame
+    const uint8_t PWR=13, CS=16, DC=12, RST=8, BUSY=14, SCLK=10, MOSI=9;
+
+    delay(1500);
+    Serial.println("\n=== v36 will+fill ===");
+    Serial.flush();
+
+    pinMode(PWR,OUTPUT); digitalWrite(PWR,HIGH);
+    delay(300);
+    pinMode(CS,OUTPUT);  digitalWrite(CS,HIGH);
+    pinMode(DC,OUTPUT);  digitalWrite(DC,LOW);
+    pinMode(RST,OUTPUT); digitalWrite(RST,HIGH);
+    pinMode(BUSY,INPUT);
+    pinMode(18,OUTPUT);  digitalWrite(18,LOW);
+    SPI.begin(SCLK, -1, MOSI, -1);
+
+    GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT> disp(GxEPD2_213_B74(CS, DC, RST, BUSY));
+    disp.init(115200, true, 2, false);
+    disp.setRotation(1);
+    int W = disp.width(), H = disp.height();
+    Serial.printf("v36 screen %dx%d\n", W, H);
+    const int T = 10;  // border thickness
+    disp.setFullWindow();
+
+    // Full white clear first to wipe any ghost of the previous frame
+    disp.clearScreen();  // fills white + full refresh
+    delay(500);
+
+    disp.firstPage();
+    do {
+        disp.fillScreen(GxEPD_WHITE);
+        disp.fillRect(0,     0,     W, T, GxEPD_BLACK);  // top
+        disp.fillRect(0,     H-T,   W, T, GxEPD_BLACK);  // bottom
+        disp.fillRect(0,     0,     T, H, GxEPD_BLACK);  // left
+        disp.fillRect(W-T,   0,     T, H, GxEPD_BLACK);  // right
+    } while (disp.nextPage());
+    Serial.println("v36 border done");
+    Serial.flush();
+    while(true){ delay(5000); Serial.println("v36 holding"); Serial.flush(); }
+}
+
+void setup() {
+    Serial.begin(115200);
+    // einkPinScan();  // pin-discovery/test routine — disabled; pins now confirmed
+                       // and folded into initializeDisplayHardware().
+
+    // Check wake reason early to apply UART stabilization if needed
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+    // UART stabilization: After deep sleep wake, the UART peripheral needs extra time
+    // to stabilize its clock/timing circuits before transmitting data reliably.
+    // Without this delay, the first ~50 characters get corrupted (bit-level framing errors).
+    // Power-on boots don't need this delay since the UART initializes cleanly.
+    if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+        delay(100);  // 100ms allows UART clock to lock and stabilize
+    }
+
+    while (!Serial && millis() < 3000) {
+        // Wait for serial port to connect (timeout after 3 seconds)
+    }
+
+    metrics.startTime = millis();
+
+    // Configure boot button (GPIO 39) as input for hold detection
+    // GPIO 39 is input-only with no internal pull-up; LilyGo T5 has external pull-up
+    // This enables button polling in the main loop and during deep sleep wake
+    pinMode(GPIO_NUM_39, INPUT);
+
+    Serial.println(F("\n\n========================================"));
+#ifdef APP_VERSION
+    Serial.println(F("pebl v" APP_VERSION));
+#else
+    Serial.println(F("pebl"));
+#endif
+    Serial.println(F("========================================"));
+
+    // Check wake reason
+    ++bootCount;
+
+    // Track if this is a wake from deep sleep (to skip boot screens)
+    bool isWakeFromSleep = false;
+
+    char bootInfo[128];
+    switch(wakeup_reason) {
+        case ESP_SLEEP_WAKEUP_TIMER:
+            snprintf(bootInfo, sizeof(bootInfo), "boot=%d reason=timer", bootCount);
+            logMessage(LOG_INFO, "POWER", "Wake from deep sleep", bootInfo);
+            isWakeFromSleep = true;
+            break;
+        case ESP_SLEEP_WAKEUP_EXT0:
+            // Button woke us up - check hold duration for tiered actions
+            delay(100);  // Debounce
+
+            if (digitalRead(GPIO_NUM_39) == LOW) {  // Button still pressed
+                handleButtonHold(true);  // needsInit=true: load config + display
+            }
+
+            // Short press = normal wake behavior
+            snprintf(bootInfo, sizeof(bootInfo), "boot=%d reason=button_gpio39", bootCount);
+            logMessage(LOG_INFO, "POWER", "Wake from button press", bootInfo);
+            isWakeFromSleep = true;
+            break;
+        case ESP_SLEEP_WAKEUP_UNDEFINED:
+            snprintf(bootInfo, sizeof(bootInfo), "boot=%d reason=power_on", bootCount);
+            logMessage(LOG_INFO, "POWER", "Power on reset", bootInfo);
+            bootCount = 0;  // Reset counter on power on
+            isWakeFromSleep = false;
+            break;
+        default:
+            snprintf(bootInfo, sizeof(bootInfo), "boot=%d reason=other(%d)", bootCount, wakeup_reason);
+            logMessage(LOG_INFO, "POWER", "Wake reason", bootInfo);
+            isWakeFromSleep = false;
+            break;
+    }
+
+    logMessage(LOG_INFO, "SYSTEM", "Boot", "version=2.0 debug=enabled");
+
+    // Initialize ConfigManager FIRST
+    logMessage(LOG_INFO, "CONFIG", "Initializing configuration");
+    if (!ConfigManager::begin()) {
+        logMessage(LOG_ERROR, "CONFIG", "Failed to load configuration");
+        // Continue with defaults
+    }
+
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    // Set clock floor to firmware build date so the clock is never at 1970.
+    // On cold boot (or deep sleep wake with lost RTC), the ESP32 starts at epoch 0.
+    // This ensures timestamps in logs and on the display are "at least in the right year"
+    // before WiFi connects and the timezone API sets the real time.
+    {
+        struct tm build_tm = {};
+        strptime(__DATE__ " " __TIME__, "%b %d %Y %H:%M:%S", &build_tm);
+        time_t build_epoch = mktime(&build_tm);
+        struct timeval now_tv;
+        gettimeofday(&now_tv, NULL);
+        if (now_tv.tv_sec < build_epoch) {
+            struct timeval tv;
+            tv.tv_sec = build_epoch;
+            tv.tv_usec = 0;
+            settimeofday(&tv, NULL);
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "floor=%s %s", __DATE__, __TIME__);
+            logMessage(LOG_INFO, "TIME", "Clock set to build time", logBuf);
+        }
+    }
+
+    // Set log level from config
+    if (cfg.logging.default_level == "ERROR") currentLogLevel = LOG_ERROR;
+    else if (cfg.logging.default_level == "WARN") currentLogLevel = LOG_WARN;
+    else if (cfg.logging.default_level == "INFO") currentLogLevel = LOG_INFO;
+    else if (cfg.logging.default_level == "DEBUG") currentLogLevel = LOG_DEBUG;
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "device_id=%s log_level=%s",
+             cfg.device.id.c_str(), cfg.logging.default_level.c_str());
+    logMessage(LOG_INFO, "SYSTEM", "Configuration loaded", logBuf);
+
+    // Initialize display hardware (SPI + display driver)
+    initializeDisplayHardware();
+
+    // Show branded splash screen only on power-on, not on wake from deep sleep
+    if (!isWakeFromSleep) {
+#ifdef APP_VERSION
+        DisplayManager::showSplashScreen("v" APP_VERSION);
+#else
+        DisplayManager::showSplashScreen("");
+#endif
+        delay(3000);  // Hold splash screen for 3 seconds
+    } else {
+        // On wake from sleep, preserve display state (e-paper retains image without power)
+        logMessage(LOG_INFO, "DISPLAY", "Preserving display state on wake from sleep");
+    }
+
+    // Initialize ECDH encryption if configured
+    if (cfg.security.encryption == "ecdh") {
+        if (SecurityManager::init()) {
+            logMessage(LOG_INFO, "SYSTEM", "ECDH P-256 encryption enabled");
+        } else {
+            logMessage(LOG_ERROR, "SYSTEM", "Failed to initialize ECDH encryption");
+        }
+    } else {
+        logMessage(LOG_INFO, "SYSTEM", "Encryption disabled (mode=none)");
+    }
+
+    // Initialize resilience manager with heartbeat settings
+    ResilienceManager::init(ConnectionTiming::HEARTBEAT_INTERVAL_MS, ConnectionTiming::HEARTBEAT_TIMEOUT_MS);
+    logMessage(LOG_INFO, "SYSTEM", "Resilience manager initialized");
+
+    // Initialize ADC calibration for accurate battery voltage readings
+    // Must be called before first getBatteryStatus() call
+    setupADCCalibration();
+
+    // Check power source at startup
+    logMessage(LOG_INFO, "POWER", "Checking power source at startup");
+    BatteryStatus startupBattery = getBatteryStatus();
+    bool usbPowered = startupBattery.isUSBPowered;
+    char powerBuf[128];
+    snprintf(powerBuf, sizeof(powerBuf), "startup_power_source=%s battery=%d%% voltage=%.2fV sleep_enabled=%s",
+             usbPowered ? "USB" : "BATTERY",
+             startupBattery.percentage,
+             startupBattery.voltage,
+             cfg.power.sleep_enabled ? "true" : "false");
+    logMessage(LOG_INFO, "POWER", "Startup power status", powerBuf);
+
+    // CPU frequency scaling for battery savings
+    // 160MHz provides good balance: ~30% power savings vs 240MHz, minimal performance impact
+    if (cfg.power.sleep_enabled && !usbPowered) {
+        setCpuFrequencyMhz(160);
+        logMessage(LOG_INFO, "POWER", "CPU frequency set to 160MHz for battery savings");
+    } else {
+        // USB powered or sleep disabled - use full speed
+        setCpuFrequencyMhz(240);
+        logMessage(LOG_INFO, "POWER", "CPU frequency set to 240MHz (USB powered or sleep disabled)");
+    }
+
+    // Verify CPU frequency was set correctly
+    char cpuBuf[64];
+    snprintf(cpuBuf, sizeof(cpuBuf), "actual=%dMHz", getCpuFrequencyMhz());
+    logMessage(LOG_INFO, "POWER", "CPU frequency verified", cpuBuf);
+
+    // CRITICAL: Check for low battery on wake BEFORE WiFi connection
+    // WiFi is the most power-hungry operation (~10s × 180mA = 0.5mAh per wake cycle)
+    // Show warning and optionally skip WiFi/sleep if battery is critically low
+    //
+    // Hysteresis: If we previously entered critical sleep (hasShownLowBatteryWarning),
+    // require battery to reach RECOVERY threshold (20%) before allowing boot.
+    // This prevents oscillation where voltage sag under WiFi load drops below 15%,
+    // device sleeps, voltage recovers to 16%, device boots, WiFi drops it again, repeat.
+    if (isWakeFromSleep && !usbPowered) {
+        using namespace BatteryConstants;
+        int effectiveThreshold = hasShownLowBatteryWarning
+            ? LOW_BATTERY_RECOVERY_THRESHOLD   // Previously critical: require 20% to exit
+            : LOW_BATTERY_SLEEP_THRESHOLD;     // Normal wake: 15% entry threshold
+        if (startupBattery.percentage >= 0 && startupBattery.percentage < effectiveThreshold) {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV threshold=%d%% sleep_enabled=%s",
+                     startupBattery.percentage, startupBattery.voltage,
+                     effectiveThreshold, cfg.power.sleep_enabled ? "true" : "false");
+            logMessage(LOG_WARN, "POWER", "Critical low battery on wake", logBuf);
+
+            // Show warning screen (regardless of sleep_enabled setting)
+            handleCriticalLowBatteryWarning();
+
+            // Only skip WiFi and sleep if sleep is enabled
+            if (cfg.power.sleep_enabled) {
+                logMessage(LOG_INFO, "POWER", "Critical low battery - entering indefinite sleep (button wake only)");
+                enterDeepSleep(0);
+                // Never returns, but for clarity:
+                return;
+            } else {
+                logMessage(LOG_INFO, "POWER", "Sleep disabled - continuing with WiFi connection despite low battery");
+            }
+        }
+    }
+
+    // Show boot status screen before WiFi connection (fresh boot only)
+    if (!isWakeFromSleep) {
+        DisplayManager::showBootStatus(cfg.device.name);
+    }
+
+    // Small delay before WiFi connection to let radio stabilize
+    logMessage(LOG_INFO, "WIFI", "Waiting for WiFi radio to stabilize");
+    delay(500);
+
+    // Connect to WiFi (silent mode on wake from sleep to skip connection screens)
+    if (SlackNetworkManager::connectWiFi(isWakeFromSleep)) {
+        // On wake from sleep: conditionally refresh display based on config
+        if (isWakeFromSleep) {
+            logMessage(LOG_INFO, "DISPLAY", "Wake from sleep - checking display update policy");
+
+            // Reset sleep flag (we're awake now)
+            enteringSleep = false;
+
+            // Set flag to suppress "Connected!" message when WebSocket reconnects
+            justWokeFromSleep = true;
+
+            // Reset full refresh flag (we haven't done one yet this wake cycle)
+            fullRefreshSinceWake = false;
+
+            // Determine if we should refresh the display
+            bool shouldRefreshDisplay = false;
+
+            // Check if power state changed during sleep
+            BatteryStatus batteryStatus = getBatteryStatus();
+            bool isOnBatteryNow = !batteryStatus.isUSBPowered;
+            bool powerStateChanged = (displayShowingBattery != isOnBatteryNow);
+
+            // Track wake power state to determine appropriate battery timeout later
+            // This flag persists across deep sleep cycles for timeout differentiation
+            wokeOnBattery = isOnBatteryNow;
+            if (wokeOnBattery) {
+                // Initialize battery mode timing - start counting from wake (millis() = 0)
+                rtcBatteryModeStartTime = 0;
+                rtcWasPreviouslyOnBattery = true;
+                logMessage(LOG_DEBUG, "POWER", "Woke on battery - initialized timing, will use MAX_BATTERY_RUNTIME_MS (20s) timeout");
+            } else {
+                // Woke on USB - clear battery mode state
+                rtcBatteryModeStartTime = 0;
+                rtcWasPreviouslyOnBattery = false;
+                logMessage(LOG_DEBUG, "POWER", "Woke on USB - no timeout applied");
+            }
+
+            if (cfg.display_policy.skip_refresh_on_no_message) {
+                // Smart refresh strategy
+                if (lastDisplay.contentType == DISPLAY_CONTENT_NONE && !hasShownBlankScreen) {
+                    // First boot (never shown blank screen) - show it once
+                    shouldRefreshDisplay = true;
+                    logMessage(LOG_INFO, "DISPLAY", "First boot - will show blank screen with status bar");
+                } else if (powerStateChanged) {
+                    // Power state changed during sleep - refresh to update display
+                    shouldRefreshDisplay = true;
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "power_changed from_%s to_%s",
+                             displayShowingBattery ? "battery" : "usb",
+                             isOnBatteryNow ? "battery" : "usb");
+                    logMessage(LOG_INFO, "DISPLAY", "Power state changed - updating display", logBuf);
+                } else {
+                    // No change - skip refresh (optimization)
+                    logMessage(LOG_INFO, "DISPLAY", "Preserving display - will update on new message only");
+                }
+            } else {
+                // Fallback mode: skip_refresh_on_no_message disabled
+                // Always refresh display on wake (consumes more battery but ensures display updates)
+                shouldRefreshDisplay = true;
+                logMessage(LOG_INFO, "DISPLAY", "Refresh optimization disabled - always refreshing on wake");
+            }
+
+            // Perform display refresh if needed
+            if (shouldRefreshDisplay && display) {
+                if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                    // Redraw last content from RTC memory
+                    logMessage(LOG_INFO, "RTC", "Redrawing last display content from RTC memory");
+                    restoreLastDisplay();
+                    logMessage(LOG_INFO, "DISPLAY", "Successfully restored display content after wake");
+                } else {
+                    // No saved reaction - show blank screen with just top bar
+                    logMessage(LOG_INFO, "RTC", "No saved reaction - showing blank screen with status bar");
+
+                    display->setFullWindow();
+                    display->firstPage();
+                    do {
+                        // Clear entire screen
+                        display->fillScreen(GxEPD_WHITE);
+
+                        // Draw top bar elements
+                        display->setTextColor(GxEPD_BLACK);
+
+                        // Draw battery indicator in top-right
+                        DisplayManager::drawBatteryIndicator();
+
+                        // Draw "BATTERY" text in center if on battery power
+                        DisplayManager::drawPowerStatusIndicator();
+
+                        // Draw lock icon in top-left (unlocked state by default)
+                        DisplayManager::drawUnlockIcon();
+
+                    } while (display->nextPage());
+
+                    logMessage(LOG_INFO, "DISPLAY", "Blank screen with status bar displayed");
+                }
+
+                // Mark that full refresh has happened and update display state
+                fullRefreshSinceWake = true;
+                displayShowingBattery = isOnBatteryNow;
+                hasShownBlankScreen = true;  // Mark that we've shown the blank screen
+
+                char stateBuf[64];
+                snprintf(stateBuf, sizeof(stateBuf), "fullRefresh=true displayShowingBattery=%s",
+                         displayShowingBattery ? "true" : "false");
+                logMessage(LOG_DEBUG, "DISPLAY", "Display state updated after refresh", stateBuf);
+            }
+        }
+
+        // DNS stabilization: After WiFi connection, DNS resolver needs time to initialize
+        // HTTPS requests (especially SSL handshake) will fail if DNS isn't ready
+        logMessage(LOG_DEBUG, "NETWORK", "Waiting for DNS resolver to stabilize");
+        delay(2000);  // 2 seconds for DNS to fully initialize
+
+        // Self-service pairing: If auth_token is empty, enter pairing mode.
+        // Pairing requests a code from the server, displays it on e-paper, and polls
+        // until the user enters the code in Slack. On success, auth_token is saved to
+        // config.json and execution continues. On failure/timeout, device deep sleeps.
+        if (cfg.security.auth_token.isEmpty()) {
+            logMessage(LOG_INFO, "PAIRING", "No auth_token configured - entering pairing mode");
+            enterPairingMode();
+            // If we reach here, pairing succeeded and auth_token is saved.
+            // Re-read config reference since auth_token was updated via getMutableConfig().
+            // The existing cfg reference (const&) already points to the same AppConfig object,
+            // so it reflects the updated auth_token without needing to reload.
+            logMessage(LOG_INFO, "PAIRING", "Pairing complete - continuing normal boot");
+        }
+
+        // Timezone sync logic (after WiFi connected)
+        bool isPowerOnBoot = (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED);
+
+        if (shouldSyncTimezone(isPowerOnBoot)) {
+            if (!hasEverSynced) {
+                logMessage(LOG_INFO, "TIME", "Timezone sync needed (never synced)");
+            } else {
+                char syncBuf[128];
+                time_t elapsedSinceSync = currentTime - lastTimeSyncTimestamp;
+                snprintf(syncBuf, sizeof(syncBuf), "elapsed=%ldh", elapsedSinceSync / 3600);
+                logMessage(LOG_INFO, "TIME", "Timezone sync needed (scheduled)", syncBuf);
+            }
+
+            if (fetchTimezoneFromAPI()) {
+                // Sync successful
+                char timeBuf[64];
+                int hour = getCurrentLocalHour();
+                snprintf(timeBuf, sizeof(timeBuf), "current_hour=%d quiet_hours=%s",
+                        hour, isQuietHours() ? "yes" : "no");
+                logMessage(LOG_INFO, "TIME", "Timezone sync complete", timeBuf);
+
+                // SSL/TLS cleanup delay: After HTTPS timezone fetch, allow SSL/TLS stack time to
+                // release resources before WebSocket SSL handshake. Without this, the first WebSocket
+                // connection may fail with ABNORMAL_CLOSURE (1006) due to resource contention between
+                // HTTPClient SSL and WebSocket SSL operations.
+                delay(1000);
+            } else {
+                // Sync failed - will retry on next wake if shouldSyncTimezone() returns true
+                if (!hasEverSynced) {
+                    logMessage(LOG_WARN, "TIME", "CRITICAL: First timezone sync failed - will retry on next wake");
+                } else {
+                    logMessage(LOG_WARN, "TIME", "Timezone sync failed, will retry on next wake");
+                }
+            }
+        } else {
+            // Update time from RTC
+            updateEstimatedTime();
+
+            // Log current time status
+            char timeBuf[128];
+            int hour = getCurrentLocalHour();
+            time_t elapsedSinceSync = currentTime - lastTimeSyncTimestamp;
+            time_t nextSyncIn = (cfg.timezone.sync_interval_hours * 3600) - elapsedSinceSync;
+
+            snprintf(timeBuf, sizeof(timeBuf),
+                    "time_since_sync=%ldh next_sync_in=%ldh current_hour=%d",
+                    elapsedSinceSync / 3600,
+                    nextSyncIn / 3600,
+                    hour);
+            logMessage(LOG_DEBUG, "TIME", "Using RTC time", timeBuf);
+        }
+
+        // Upload ECDH public key to server if not yet uploaded
+        // Must happen after WiFi connect but before WebSocket (server needs key to encrypt messages)
+        if (SecurityManager::isEnabled() && !SecurityManager::isKeyUploaded()) {
+            String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") + cfg.server.host;
+            if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+                (!cfg.server.use_ssl && cfg.server.port != 80)) {
+                serverUrl += ":" + String(cfg.server.port);
+            }
+            if (SecurityManager::uploadPublicKey(serverUrl, cfg.security.auth_token, cfg.device.id)) {
+                logMessage(LOG_INFO, "SYSTEM", "ECDH public key uploaded to server");
+            } else {
+                logMessage(LOG_WARN, "SYSTEM", "ECDH key upload failed - will retry next boot");
+            }
+        }
+
+        // Jitter initial WebSocket connection to avoid thundering herd after mass power-on.
+        // Uses deterministic FNV-1a hash of device_id so the same device always gets the
+        // same delay — predictable for debugging, distributed across fleet.
+        {
+            uint32_t jitter_max_ms = (uint32_t)cfg.server.reconnect_jitter_max_sec * 1000;
+            if (jitter_max_ms > 0) {
+                uint32_t hash = 2166136261u;
+                for (const char *p = cfg.device.id.c_str(); *p; p++) {
+                    hash ^= (uint8_t)*p;
+                    hash *= 16777619u;
+                }
+                uint32_t jitter = hash % jitter_max_ms;
+                char jitterBuf[32];
+                snprintf(jitterBuf, sizeof(jitterBuf), "jitter_ms=%lu", (unsigned long)jitter);
+                logMessage(LOG_INFO, "WS", "Reconnect jitter", jitterBuf);
+                delay(jitter);
+            }
+        }
+        delay(2000);  // DNS stabilization delay
+        SlackNetworkManager::connectWebSocket();
+
+        // Initialize OTA manager (requires network connectivity)
+        logMessage(LOG_INFO, "OTA", "Initializing OTA manager");
+
+        // Build server URL from config components
+        // Only include port if non-default (443 for HTTPS, 80 for HTTP)
+        // This prevents potential HTTP client parsing issues with explicit default ports
+        String serverUrl = String(cfg.server.use_ssl ? "https://" : "http://") + cfg.server.host;
+        if ((cfg.server.use_ssl && cfg.server.port != 443) ||
+            (!cfg.server.use_ssl && cfg.server.port != 80)) {
+            serverUrl += ":" + String(cfg.server.port);
+        }
+
+        otaManager = new OTAManager(serverUrl, cfg.device.id);
+
+        // Check boot validation (mark new firmware as valid if just updated)
+        if (otaManager->checkBootValidation()) {
+            logMessage(LOG_INFO, "OTA", "Boot validation successful - new firmware marked as valid");
+        }
+
+        // Report successful OTA update to server so Slack Home shows current version.
+        // Called unconditionally: if the POST failed on first boot after OTA,
+        // NVS entries persist and this retries on every subsequent boot until it succeeds.
+        if (otaManager->reportUpdateSuccess()) {
+            logMessage(LOG_INFO, "OTA", "Update success reported to server");
+        } else {
+            logMessage(LOG_WARN, "OTA", "Failed to report update success (will retry next boot)");
+        }
+
+        // Firmware update check occurs automatically on first WebSocket connection (power-on boot only)
+        // See WStype_CONNECTED handler for implementation. Deferred timing ensures DNS stability.
+    }
+
+    logMessage(LOG_INFO, "SYSTEM", "Setup complete");
+
+    #ifdef ENABLE_DEBUG_FEATURES
+    Serial.println(F("\n=== Debug Commands Available ==="));
+    Serial.println(F("TEST:WIFI - Test WiFi status"));
+    Serial.println(F("TEST:WS - Test WebSocket status"));
+    Serial.println(F("TEST:MSG:{json} - Inject test message"));
+    Serial.println(F("TEST:DISPLAY:text - Display test"));
+    Serial.println(F("TEST:CONFIG - Show configuration"));
+    Serial.println(F("TEST:METRICS - Show metrics"));
+    Serial.println(F("TEST:LOCK:ICONS - Test lock/unlock icons"));
+    Serial.println(F("TEST:SHUTDOWN - Test graceful shutdown"));
+    Serial.println(F("TEST:SHUTDOWN:CLEAR - Test shutdown with clear"));
+    Serial.println(F("LOG:LEVEL:ERROR/WARN/INFO/DEBUG/TEST - Set log level"));
+    Serial.println(F("================================\n"));
+    #endif
+}
+
+// ============================================================================
+// Arduino Main Loop
+// ============================================================================
+void loop() {
+    // Handle WebSocket communication
+    if (WiFi.status() == WL_CONNECTED) {
+        webSocket.loop();
+    }
+
+    // Handle reconnection logic
+    SlackNetworkManager::handleReconnection();
+
+    // Check connection health and process queued messages
+    ResilienceManager::checkHealth();
+
+    // Process queued messages once fully registered (two-phase handshake complete)
+    if (wsRegistered && ResilienceManager::hasQueuedMessages()) {
+        ResilienceManager::processQueuedMessages();
+    }
+
+    // OTA Update Management
+    // Periodic check every 24 hours (only for devices that stay awake continuously on USB)
+    // For devices using deep sleep, updates are delivered via WebSocket push or on power-on boot
+    // millis() overflow-safe: subtraction works correctly even after 49 days
+    if (otaManager && (millis() - lastOTACheckMillis) > 24UL * 60UL * 60UL * 1000UL) {
+        logMessage(LOG_INFO, "OTA", "24 hours since last check - checking for updates");
+        checkForFirmwareUpdate();
+        lastOTACheckMillis = millis();
+    }
+
+    // Install pending update when device is idle
+    if (otaManager && pendingUpdate && isDeviceIdle()) {
+        performOTAUpdate();
+        pendingUpdate = false;
+    }
+
+    #ifdef ENABLE_DEBUG_FEATURES
+    // Process serial commands
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (commandBuffer.length() > 0) {
+                processSerialCommand(commandBuffer);
+                commandBuffer = "";
+            }
+        } else {
+            commandBuffer += c;
+        }
+    }
+    #endif
+
+    // Button hold detection while awake (USB or between sleep cycles)
+    // GPIO 39 is LOW when pressed (external pull-up on LilyGo T5 board)
+    static bool buttonWasPressed = false;
+    if (digitalRead(GPIO_NUM_39) == LOW) {
+        if (!buttonWasPressed) {
+            buttonWasPressed = true;
+            // Button just pressed — run tiered hold handler
+            // This blocks until button is released (up to 12s), same as deep sleep wake path
+            handleButtonHold(false);  // needsInit=false: config and display already initialized
+        }
+    } else {
+        buttonWasPressed = false;
+    }
+
+    // Power management - check battery status every 10 seconds
+    using namespace BatteryConstants;
+    const AppConfig& cfg = ConfigManager::getConfig();
+
+    static unsigned long lastPowerCheck = 0;
+    unsigned long now = millis();
+
+    // Check power status every 10 seconds (rollover-safe comparison)
+    if ((unsigned long)(now - lastPowerCheck) > 10000) {
+        lastPowerCheck = now;
+
+        // Force fresh battery read (no caching) for 10-second power check
+        BatteryStatus batteryStatus = getBatteryStatus(true);
+        bool isOnBattery = !batteryStatus.isUSBPowered;
+        int batteryPct = batteryStatus.percentage;
+
+        // Detect USB reconnection and reset warning flag
+        // Uses rtcLastUSBState which is updated inside getBatteryStatus()
+        static bool lastKnownUSBState = rtcLastUSBState;  // Track for edge detection
+        if (batteryStatus.isUSBPowered && !lastKnownUSBState) {
+            hasShownLowBatteryWarning = false;  // Reset warning flag when USB is plugged in
+            logMessage(LOG_INFO, "POWER", "USB connected - low battery warning flag reset");
+        }
+        lastKnownUSBState = batteryStatus.isUSBPowered;
+
+        // Check for critically low battery (regardless of sleep_enabled)
+        // This ensures users are warned even if they've disabled sleep
+        if (isOnBattery && batteryPct >= 0 && batteryPct < LOW_BATTERY_SLEEP_THRESHOLD) {
+            char logBuf[128];
+            snprintf(logBuf, sizeof(logBuf), "battery=%d%% voltage=%.2fV sleep_enabled=%s",
+                     batteryPct, batteryStatus.voltage,
+                     cfg.power.sleep_enabled ? "true" : "false");
+            logMessage(LOG_WARN, "POWER", "Critical low battery in loop", logBuf);
+
+            // Show warning screen (regardless of sleep_enabled)
+            handleCriticalLowBatteryWarning();
+
+            // Only enter deep sleep if sleep is enabled
+            if (cfg.power.sleep_enabled) {
+                logMessage(LOG_INFO, "POWER", "Critical low battery - entering indefinite sleep (button wake only)");
+                enterDeepSleep(0);
+                return;  // Never reached, but for clarity
+            } else {
+                logMessage(LOG_INFO, "POWER", "Sleep disabled - staying awake despite low battery");
+            }
+        }
+
+        // Additional power management logic (only when sleep is enabled)
+        if (cfg.power.sleep_enabled) {
+            // Use RTC memory for battery state (survives deep sleep)
+            unsigned long& batteryModeStartTime = rtcBatteryModeStartTime;
+            bool& wasPreviouslyOnBattery = rtcWasPreviouslyOnBattery;
+
+            // Track when we first switched to battery mode
+            if (isOnBattery && !wasPreviouslyOnBattery) {
+                batteryModeStartTime = now;
+                wasPreviouslyOnBattery = true;
+                // Note: Don't modify wokeOnBattery here - it's only set during wake from sleep
+                logMessage(LOG_INFO, "POWER", "Switched to battery mode (USB unplugged)", "grace_period=60s");
+
+                // Update display to show "BATTERY" text at top
+                if (fullRefreshSinceWake && display) {
+                    // Safe for partial refresh - controller RAM is synced
+                    display->setPartialWindow(0, 0, display->width(), 15);
+                    display->firstPage();
+                    do {
+                        display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                        DisplayManager::drawBatteryIndicator();
+                        DisplayManager::drawPowerStatusIndicator();
+                        // Redraw lock icon if encryption enabled
+                        if (SecurityManager::isEnabled()) {
+                            DisplayManager::drawLockIcon();
+                        }
+                    } while (display->nextPage());
+                    displayShowingBattery = true;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Partial refresh: added BATTERY text");
+                } else if (display) {
+                    // NOT safe for partial - need full refresh
+                    logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction with BATTERY");
+                    if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                        restoreLastDisplay();
+                    } else {
+                        // Show blank screen with BATTERY
+                        display->setFullWindow();
+                        display->firstPage();
+                        do {
+                            display->fillScreen(GxEPD_WHITE);
+                            display->setTextColor(GxEPD_BLACK);
+                            DisplayManager::drawBatteryIndicator();
+                            DisplayManager::drawPowerStatusIndicator();
+                            DisplayManager::drawUnlockIcon();
+                        } while (display->nextPage());
+                    }
+                    fullRefreshSinceWake = true;
+                    displayShowingBattery = true;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Full refresh: now showing BATTERY text");
+                }
+
+            } else if (!isOnBattery && wasPreviouslyOnBattery) {
+                wasPreviouslyOnBattery = false;
+                batteryModeStartTime = 0;  // Reset timer when switching to USB
+                // Note: hasShownLowBatteryWarning reset is handled above (outside sleep_enabled block)
+                logMessage(LOG_INFO, "POWER", "Switched to USB mode", "");
+
+                // Update display to remove "BATTERY" text (top bar shows nothing on USB)
+                if (fullRefreshSinceWake && display) {
+                    // Safe for partial refresh - controller RAM is synced
+                    display->setPartialWindow(0, 0, display->width(), 15);
+                    display->firstPage();
+                    do {
+                        display->fillRect(0, 0, display->width(), 15, GxEPD_WHITE);  // Clear top bar
+                        DisplayManager::drawBatteryIndicator();
+                        DisplayManager::drawPowerStatusIndicator();  // Shows nothing on USB
+                        // Redraw lock icon if encryption enabled
+                        if (SecurityManager::isEnabled()) {
+                            DisplayManager::drawLockIcon();
+                        }
+                    } while (display->nextPage());
+                    displayShowingBattery = false;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Partial refresh: removed BATTERY text");
+                } else if (display) {
+                    // NOT safe for partial - need full refresh
+                    logMessage(LOG_INFO, "DISPLAY", "Full refresh required - redrawing saved reaction without BATTERY");
+                    if (lastDisplay.contentType != DISPLAY_CONTENT_NONE) {
+                        restoreLastDisplay();
+                    } else {
+                        // Show blank screen without BATTERY
+                        display->setFullWindow();
+                        display->firstPage();
+                        do {
+                            display->fillScreen(GxEPD_WHITE);
+                            display->setTextColor(GxEPD_BLACK);
+                            DisplayManager::drawBatteryIndicator();
+                            DisplayManager::drawPowerStatusIndicator();
+                            DisplayManager::drawUnlockIcon();
+                        } while (display->nextPage());
+                    }
+                    fullRefreshSinceWake = true;
+                    displayShowingBattery = false;
+                    logMessage(LOG_DEBUG, "DISPLAY", "Full refresh: now NOT showing BATTERY text");
+                }
+            }
+
+            if (isOnBattery) {
+                // Calculate time on battery (rollover-safe)
+                unsigned long timeOnBattery = (unsigned long)(now - batteryModeStartTime);
+
+                // Battery timeout varies by power transition scenario for optimal behavior:
+                // Scenario 1: Woke on battery (batteryModeStartTime = 0, wokeOnBattery = true)
+                //   → Use 20s timeout: Device was already unplugged, minimize battery drain
+                // Scenario 2: USB unplugged while awake (batteryModeStartTime > 0, set during runtime)
+                //   → Use 60s grace period: Allow user to finish interactions after unplugging
+                unsigned long sleepTimeout;
+                const char* timeoutReason;
+
+                // Detect scenario: batteryModeStartTime=0 means we woke already on battery
+                // batteryModeStartTime>0 means USB was unplugged during this wake cycle
+                bool isWakeOnBattery = (wokeOnBattery && wasPreviouslyOnBattery && batteryModeStartTime == 0);
+
+                if (isWakeOnBattery) {
+                    // Woke from sleep on battery - use short timeout for battery optimization
+                    sleepTimeout = MAX_BATTERY_RUNTIME_MS;  // 20s
+                    timeoutReason = "wake_on_battery";
+                } else {
+                    // USB was unplugged while awake - use grace period for stability
+                    sleepTimeout = GRACE_PERIOD_MS;  // 60s
+                    timeoutReason = "usb_unplugged";
+                }
+
+                if (timeOnBattery < sleepTimeout) {
+                    char logBuf[128];
+                    snprintf(logBuf, sizeof(logBuf), "scenario=%s timeout=%lus time_on_battery=%lus",
+                             timeoutReason, sleepTimeout / 1000, timeOnBattery / 1000);
+                    logMessage(LOG_DEBUG, "POWER", "Battery mode - within timeout", logBuf);
+                } else {
+                    // Timeout exceeded, apply sleep logic
+                    bool shouldSleep = false;
+                    const char* sleepReason = nullptr;
+
+                    // Sleep if no WebSocket connection (already past timeout)
+                    if (!wsConnected) {
+                        shouldSleep = true;
+                        sleepReason = "no_connection";
+                    }
+                    // When connected, extend by 15s to receive pending messages before sleeping.
+                    // This covers the case where a reaction arrives just as the timeout fires —
+                    // without the extension, the device would sleep before processing it.
+                    else if (timeOnBattery > sleepTimeout + 15000) {
+                        shouldSleep = true;
+                        sleepReason = "connected_timeout";
+                    }
+                    else {
+                        logMessage(LOG_DEBUG, "POWER", "Connected - extending wake for message reception");
+                    }
+
+                    if (shouldSleep) {
+                        char logBuf[128];
+                        snprintf(logBuf, sizeof(logBuf), "reason=%s time_on_battery=%lus battery=%d%% wsConnected=%s",
+                                 sleepReason, timeOnBattery / 1000, batteryPct, wsConnected ? "true" : "false");
+                        logMessage(LOG_INFO, "POWER", "Battery mode sleep triggered", logBuf);
+                        enterDeepSleep(calculateSleepDuration());
+                    }
+                }
+            } else {
+                logMessage(LOG_DEBUG, "POWER", "USB powered - staying awake");
+            }
+        } else {
+            static bool loggedOnce = false;
+            if (!loggedOnce) {
+                logMessage(LOG_INFO, "POWER", "Sleep disabled in config");
+                loggedOnce = true;
+            }
+        }
+    }
+
+    // Small delay to prevent tight looping
+    delay(10);
+}
+
+// ============================================================================
+// OTA Helper Functions
+// ============================================================================
+
+/**
+ * Check for firmware updates from server
+ * Called on boot and periodically every 24 hours
+ */
+void checkForFirmwareUpdate() {
+    if (!otaManager) {
+        logMessage(LOG_ERROR, "OTA", "OTA manager not initialized");
+        return;
+    }
+
+    logMessage(LOG_INFO, "OTA", "Checking for firmware updates");
+
+    OTAManager::FirmwareInfo info;
+    if (otaManager->checkForUpdate(info)) {
+        char logBuf[256];
+        snprintf(logBuf, sizeof(logBuf), "version=%s size=%d required=%s",
+                 info.version.c_str(), info.size, info.required ? "true" : "false");
+        logMessage(LOG_INFO, "OTA", "Update available", logBuf);
+
+        if (info.required) {
+            logMessage(LOG_WARN, "OTA", "Required update - installing immediately");
+            performOTAUpdate();
+        } else {
+            logMessage(LOG_INFO, "OTA", "Optional update - will install when idle");
+            pendingUpdate = true;
+            pendingVersion = info.version;
+        }
+    } else {
+        // checkForUpdate returns false for two normal cases:
+        // 1. No firmware configured on server
+        // 2. Already up to date
+        // OTAManager logs detailed status internally, so only log errors here
+        if (otaManager->getStatus() == OTAManager::OTAStatus::FAILED) {
+            logMessage(LOG_ERROR, "OTA", "Update check failed", otaManager->getLastError().c_str());
+        }
+        // Success case (up to date or no firmware) already logged by OTAManager
+    }
+}
+
+/**
+ * Perform OTA update
+ * Downloads and installs firmware, then reboots device
+ */
+void performOTAUpdate() {
+    if (!otaManager) {
+        logMessage(LOG_ERROR, "OTA", "OTA manager not initialized");
+        return;
+    }
+
+    logMessage(LOG_INFO, "OTA", "Starting firmware update");
+
+    // Show update message on display
+    if (display) {
+        DisplayManager::showMessage("Firmware Update", "Checking...", "Please wait");
+    }
+
+    // Get firmware info
+    OTAManager::FirmwareInfo info;
+    if (!otaManager->checkForUpdate(info)) {
+        logMessage(LOG_ERROR, "OTA", "Failed to get firmware info", otaManager->getLastError().c_str());
+        if (display) {
+            DisplayManager::showMessage("Update Failed", "Cannot get firmware info");
+        }
+        return;
+    }
+
+    // Show version being installed
+    logMessage(LOG_INFO, "OTA", "Downloading version", info.version.c_str());
+    if (display) {
+        char versionMsg[64];
+        snprintf(versionMsg, sizeof(versionMsg), "Downloading v%s", info.version.c_str());
+        DisplayManager::showMessage("Firmware Update", versionMsg, "Please wait");
+    }
+
+    // Download and install with progress callback
+    // Plain function pointer (no captures) — OTA API requires raw function pointer
+    bool success = otaManager->downloadAndInstall(info, [](size_t current, size_t total) {
+        // Progress callback - update display every 20%
+        // (E-paper refresh is slow, so fewer updates = faster install)
+        static int lastPercent = -1;
+        int percent = (current * 100) / total;
+        if (percent != lastPercent && percent % 20 == 0) {
+            lastPercent = percent;
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%d%%", percent);
+            logMessage(LOG_INFO, "OTA", "Download progress", buf);
+
+            if (display) {
+                DisplayManager::showMessage("Firmware Update", buf, "Please wait");
+            }
+        }
+    });
+
+    if (success) {
+        logMessage(LOG_INFO, "OTA", "Firmware update successful - rebooting");
+        if (display) {
+            char completeMsg[64];
+            snprintf(completeMsg, sizeof(completeMsg), "v%s installed", info.version.c_str());
+            DisplayManager::showMessage("Update Complete", completeMsg, "Rebooting...");
+        }
+        delay(2000);
+        ESP.restart();  // Reboot to new firmware
+    } else {
+        logMessage(LOG_ERROR, "OTA", "Firmware update failed", otaManager->getLastError().c_str());
+        if (display) {
+            DisplayManager::showMessage("Update Failed", otaManager->getLastError().c_str());
+        }
+    }
+}
+
+/**
+ * Check if device is idle (no reactions for 5 minutes)
+ * Used to determine when it's safe to perform optional updates
+ */
+bool isDeviceIdle() {
+    const unsigned long IDLE_THRESHOLD_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+
+    // If no reactions yet, consider idle
+    if (lastReactionTime == 0) {
+        return true;
+    }
+
+    // Check if enough time has passed since last reaction
+    unsigned long timeSinceReaction = millis() - lastReactionTime;
+    return timeSinceReaction > IDLE_THRESHOLD_MS;
+}
