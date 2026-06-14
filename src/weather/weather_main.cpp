@@ -25,6 +25,7 @@
 #include <epd/GxEPD2_213_B74.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <esp_sleep.h>
 
@@ -247,55 +248,80 @@ static void drawDegreeF(int x, int topY, bool showF) {
     }
 }
 
+// One-word condition for the big readable layout (mockup uses single words).
+static const char* shortLabelOf(int code) {
+    switch (catOf(code)) {
+        case CAT_CLEAR:  return "Clear";
+        case CAT_PCLOUD: return "Cloudy";
+        case CAT_CLOUD:  return "Cloudy";
+        case CAT_FOG:    return "Fog";
+        case CAT_RAIN:   return "Rain";
+        case CAT_SNOW:   return "Snow";
+        case CAT_STORM:  return "Storm";
+    }
+    return "—";
+}
+
+// Pixel width of an integer rendered in the current font/size.
+static int numWidth(int val) {
+    char b[8]; snprintf(b, sizeof(b), "%d", val);
+    int16_t x, y; uint16_t w, h;
+    display.getTextBounds(b, 0, 0, &x, &y, &w, &h);
+    return w;
+}
+
+// Draw an integer temperature at (leftX, baseline) with a trailing degree ring.
+static void drawTempAt(int val, int leftX, int baseY, int degR, int degCenterY) {
+    char b[8]; snprintf(b, sizeof(b), "%d", val);
+    display.setCursor(leftX, baseY);
+    display.print(b);
+    int ex = display.getCursorX();
+    display.drawCircle(ex + degR + 3, degCenterY, degR, GxEPD_BLACK);
+    if (degR > 4) display.drawCircle(ex + degR + 3, degCenterY, degR - 1, GxEPD_BLACK);
+}
+
 static void renderWeather(const Weather& w) {
     int W = display.width(), H = display.height();
+    // ---- LAYOUT KNOBS (tweak these) ----
+    const int DIV       = 92;   // x split: left = High/Low, right = current temp
+    const int HI_BASE   = 56;   // baseline y of the High temp (left, upper)
+    const int LO_BASE   = 106;  // baseline y of the Low temp  (left, lower)
+    const int CUR_BASE  = 68;   // baseline y of the big current temp (right)
+    const int COND_BASE = 102;  // baseline y of the condition word (right)
+
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
-        display.drawRect(0, 0, W, H, GxEPD_BLACK);          // frame
 
-        // City (top-left)
-        display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(8, 18);
-        String city = w.city; if (city.length() > 18) city = city.substring(0, 18);
-        display.print(city);
-        display.drawFastHLine(8, 24, W - 16, GxEPD_BLACK);
+        // ---- LEFT: High over Low, stacked ----
+        display.setFont(&FreeSansBold18pt7b);
+        display.setTextSize(1);
+        drawTempAt((int)lroundf(w.hi), 10, HI_BASE, 5, HI_BASE - 21);
+        drawTempAt((int)lroundf(w.lo), 10, LO_BASE, 5, LO_BASE - 21);
 
-        // Big temperature (left)
+        // ---- RIGHT: big current temp, centered in the right column ----
         display.setFont(&FreeSansBold18pt7b);
         display.setTextSize(2);
-        int tnum = (int)lroundf(w.temp);
-        display.setCursor(8, 86);
-        display.print(tnum);
-        int afterX = display.getCursorX();
+        int cur  = (int)lroundf(w.temp);
+        int degR = 8;
+        int totalW = numWidth(cur) + degR * 2 + 5;
+        int rcx = DIV + (W - DIV) / 2;                 // center of right column
+        int sx  = rcx - totalW / 2;
+        if (sx < DIV + 2) sx = DIV + 2;
+        drawTempAt(cur, sx, CUR_BASE, degR, CUR_BASE - 40);
+
+        // ---- condition word, centered under the temp ----
         display.setTextSize(1);
-        drawDegreeF(afterX, 46, true);
-
-        // Condition label (under temp)
-        display.setFont(&FreeSans9pt7b);
-        display.setCursor(10, 104);
-        display.print(labelOf(w.code));
-
-        // High / Low (bottom)
-        display.setFont(&FreeSansBold9pt7b);
-        display.setCursor(10, H - 6);
-        char hl[32];
-        snprintf(hl, sizeof(hl), "H %d   L %d", (int)lroundf(w.hi), (int)lroundf(w.lo));
-        display.print(hl);
-
-        // Updated time (bottom-right)
-        if (w.updated.length()) {
-            display.setFont(&FreeSans9pt7b);
-            int16_t bx, by; uint16_t bw, bh;
-            display.getTextBounds(w.updated, 0, 0, &bx, &by, &bw, &bh);
-            display.setCursor(W - bw - 8, H - 6);
-            display.print(w.updated);
-        }
-
-        // Weather icon (right side)
-        drawIcon(w.code, W - 52, 64, 56);
+        display.setFont(&FreeSansBold12pt7b);
+        const char* lab = shortLabelOf(w.code);
+        int16_t bx, by; uint16_t bw, bh;
+        display.getTextBounds(lab, 0, 0, &bx, &by, &bw, &bh);
+        int lx = rcx - bw / 2;
+        if (lx < DIV + 2) lx = DIV + 2;
+        display.setCursor(lx, COND_BASE);
+        display.print(lab);
     } while (display.nextPage());
 }
 
