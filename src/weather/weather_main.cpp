@@ -27,6 +27,7 @@
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
+#include "weather_fonts.h"   // WeatherBig (temp), WeatherHL (Hi/Lo), WeatherCond (condition)
 #include <esp_sleep.h>
 
 // ----- CONFIRMED DISPLAY PINS (pebl ESP32-S3) -----
@@ -257,7 +258,7 @@ static const char* shortLabelOf(int code) {
         case CAT_FOG:    return "Fog";
         case CAT_RAIN:   return "Rain";
         case CAT_SNOW:   return "Snow";
-        case CAT_STORM:  return "Storm";
+        case CAT_STORM:  return "Thunderstorm";
     }
     return "—";
 }
@@ -270,57 +271,49 @@ static int numWidth(int val) {
     return w;
 }
 
-// Draw an integer temperature at (leftX, baseline) with a trailing degree ring.
-static void drawTempAt(int val, int leftX, int baseY, int degR, int degCenterY) {
+// Draw an integer temperature at (leftX, baseline). No degree symbol.
+static void drawTempAt(int val, int leftX, int baseY) {
     char b[8]; snprintf(b, sizeof(b), "%d", val);
     display.setCursor(leftX, baseY);
     display.print(b);
-    int ex = display.getCursorX();
-    display.drawCircle(ex + degR + 3, degCenterY, degR, GxEPD_BLACK);
-    if (degR > 4) display.drawCircle(ex + degR + 3, degCenterY, degR - 1, GxEPD_BLACK);
 }
 
 static void renderWeather(const Weather& w) {
-    int W = display.width(), H = display.height();
-    // ---- LAYOUT KNOBS (tweak these) ----
-    const int DIV       = 92;   // x split: left = High/Low, right = current temp
-    const int HI_BASE   = 56;   // baseline y of the High temp (left, upper)
-    const int LO_BASE   = 106;  // baseline y of the Low temp  (left, lower)
-    const int CUR_BASE  = 68;   // baseline y of the big current temp (right)
-    const int COND_BASE = 102;  // baseline y of the condition word (right)
+    int W = display.width();
+    // ---- LAYOUT KNOBS ----
+    const int LEFT_X    = 8;        // HI/LO are left-aligned to here
+    const int RIGHT_X   = W - 8;    // current temp + condition are right-aligned to here
+    const int HI_BASE   = 36;       // baseline y of the High temp (left, upper)
+    const int LO_BASE   = 84;       // baseline y of the Low temp  (left, lower)
+    const int CUR_BASE  = 84;       // baseline y of the big current temp (right)
+    const int COND_BASE = 114;      // baseline y of the condition word (right)
 
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
-
-        // ---- LEFT: High over Low, stacked ----
-        display.setFont(&FreeSansBold18pt7b);
-        display.setTextSize(1);
-        drawTempAt((int)lroundf(w.hi), 10, HI_BASE, 5, HI_BASE - 21);
-        drawTempAt((int)lroundf(w.lo), 10, LO_BASE, 5, LO_BASE - 21);
-
-        // ---- RIGHT: big current temp, centered in the right column ----
-        display.setFont(&FreeSansBold18pt7b);
-        display.setTextSize(2);
-        int cur  = (int)lroundf(w.temp);
-        int degR = 8;
-        int totalW = numWidth(cur) + degR * 2 + 5;
-        int rcx = DIV + (W - DIV) / 2;                 // center of right column
-        int sx  = rcx - totalW / 2;
-        if (sx < DIV + 2) sx = DIV + 2;
-        drawTempAt(cur, sx, CUR_BASE, degR, CUR_BASE - 40);
-
-        // ---- condition word, centered under the temp ----
-        display.setTextSize(1);
-        display.setFont(&FreeSansBold12pt7b);
-        const char* lab = shortLabelOf(w.code);
         int16_t bx, by; uint16_t bw, bh;
+
+        // ---- LEFT: High over Low, left-aligned (Dimitri) ----
+        display.setFont(&WeatherHL);
+        display.setTextSize(1);
+        drawTempAt((int)lroundf(w.hi), LEFT_X, HI_BASE);
+        drawTempAt((int)lroundf(w.lo), LEFT_X, LO_BASE);
+
+        // ---- RIGHT: big current temp, right-aligned (Dimitri Swank) ----
+        display.setFont(&WeatherBig);
+        display.setTextSize(1);
+        char cbuf[8]; snprintf(cbuf, sizeof(cbuf), "%d", (int)lroundf(w.temp));
+        display.getTextBounds(cbuf, 0, 0, &bx, &by, &bw, &bh);
+        display.setCursor(RIGHT_X - bw - bx, CUR_BASE);
+        display.print(cbuf);
+
+        // ---- condition word, right-aligned under the temp (Dimitri Swank) ----
+        display.setFont(&WeatherCond);
+        const char* lab = shortLabelOf(w.code);
         display.getTextBounds(lab, 0, 0, &bx, &by, &bw, &bh);
-        int lx = rcx - bw / 2;
-        if (lx < DIV + 2) lx = DIV + 2;
-        display.setCursor(lx, COND_BASE);
+        display.setCursor(RIGHT_X - bw - bx, COND_BASE);
         display.print(lab);
     } while (display.nextPage());
 }

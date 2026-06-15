@@ -6,3 +6,7 @@
 data/config.json
 .DS_Store
 data/get-platformio.py
+
+# editor swap files
+*.swp
+*.swo
