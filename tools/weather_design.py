@@ -28,8 +28,8 @@ from PIL import Image, ImageDraw
 # ============================ CONFIG — EDIT ME ============================
 # Font files (any .ttf). Swap these to try a totally different typeface.
 FONT_BIG  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # big current temp
-FONT_HL   = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # small Hi / Lo
-FONT_COND = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # condition word
+FONT_HL   = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # Hi / Lo
+FONT_COND = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # condition word + weekday
 
 # Glyph height in pixels for each element (bigger = bigger text).
 H_BIG  = 76   # current temp
@@ -44,12 +44,14 @@ H_COND = 21   # condition word
 LEFT_X    = 8        # Hi/Lo left edge
 RIGHT_X   = 250 - 8  # right edge that the temp + condition align to
 HI_BASE   = 36       # Hi baseline
-LO_BASE   = 84       # Lo baseline
+LO_BASE   = 75       # Lo baseline
 CUR_BASE  = 84       # current-temp baseline
 COND_BASE = 114      # condition baseline
+DAY_BASE  = 114      # weekday baseline (left, under Lo; shares the condition row)
+# Left column (Hi, Lo, day) sits on an even 39px baseline grid: 36 / 75 / 114.
 
 # What to show in the preview (change to test different values / longest words).
-PREVIEW = dict(hi="102", lo="89", cur="98", cond="Thunderstorm")
+PREVIEW = dict(hi="102", lo="89", cur="98", cond="Cloudy", day="Wed")
 # ========================================================================
 
 DPI = 141                       # matches Adafruit fontconvert
@@ -136,6 +138,7 @@ def main():
     img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)   # e-ink gray
     blit(d, hl,   PREVIEW['hi'], LEFT_X, HI_BASE)
     blit(d, hl,   PREVIEW['lo'], LEFT_X, LO_BASE)
+    blit(d, cond, PREVIEW['day'], LEFT_X, DAY_BASE)
     blit(d, big,  PREVIEW['cur'],  RIGHT_X - text_w(big,  PREVIEW['cur']),  CUR_BASE)
     blit(d, cond, PREVIEW['cond'], RIGHT_X - text_w(cond, PREVIEW['cond']), COND_BASE)
     img.point(lambda x: 0 if x < 128 else 236).resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)

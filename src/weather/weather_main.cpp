@@ -56,6 +56,7 @@ struct Weather {
     int    code = 0;
     String city = "";
     String updated = "";   // "3:45 PM"
+    String day = "";       // "Mon" — location-local weekday of the reading
 };
 
 // Icon categories derived from WMO weather codes
@@ -153,6 +154,15 @@ static String to12h(const String& hm) {        // "15:45" -> "3:45 PM"
     return String(h12) + ":" + m + " " + ap;
 }
 
+// Three-letter weekday for a Gregorian date (Sakamoto's method).
+static const char* weekdayAbbr(int y, int m, int d) {
+    static const char* const names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const int offs[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 1 || m > 12 || d < 1 || d > 31) return "";
+    if (m < 3) y--;
+    return names[(y + y / 4 - y / 100 + y / 400 + offs[m - 1] + d) % 7];
+}
+
 static bool getWeather(double lat, double lon, Weather& w) {
     char url[320];
     snprintf(url, sizeof(url),
@@ -175,6 +185,11 @@ static bool getWeather(double lat, double lon, Weather& w) {
     String t = String((const char*)(doc["current"]["time"] | ""));  // "2026-06-13T15:45"
     int tpos = t.indexOf('T');
     w.updated = (tpos >= 0) ? to12h(t.substring(tpos + 1)) : "";
+    // Weekday of the reading, shown so a stale screen (dead battery) is obvious.
+    // Open-Meteo already returns location-local time (timezone=auto).
+    if (tpos == 10)
+        w.day = weekdayAbbr(t.substring(0, 4).toInt(), t.substring(5, 7).toInt(),
+                            t.substring(8, 10).toInt());
     w.ok = true;
     return true;
 }
@@ -258,7 +273,7 @@ static const char* shortLabelOf(int code) {
         case CAT_FOG:    return "Fog";
         case CAT_RAIN:   return "Rain";
         case CAT_SNOW:   return "Snow";
-        case CAT_STORM:  return "Thunderstorm";
+        case CAT_STORM:  return "Storm";  // short enough to share the row with the weekday
     }
     return "—";
 }
@@ -284,9 +299,11 @@ static void renderWeather(const Weather& w) {
     const int LEFT_X    = 8;        // HI/LO are left-aligned to here
     const int RIGHT_X   = W - 8;    // current temp + condition are right-aligned to here
     const int HI_BASE   = 36;       // baseline y of the High temp (left, upper)
-    const int LO_BASE   = 84;       // baseline y of the Low temp  (left, lower)
+    const int LO_BASE   = 75;       // baseline y of the Low temp  (left, middle)
     const int CUR_BASE  = 84;       // baseline y of the big current temp (right)
     const int COND_BASE = 114;      // baseline y of the condition word (right)
+    const int DAY_BASE  = 114;      // baseline y of the weekday (left, bottom)
+    // Left column (Hi, Lo, day) is on an even 39px baseline grid: 36 / 75 / 114.
 
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
@@ -295,11 +312,16 @@ static void renderWeather(const Weather& w) {
         display.fillScreen(GxEPD_WHITE);
         int16_t bx, by; uint16_t bw, bh;
 
-        // ---- LEFT: High over Low, left-aligned (Dimitri) ----
+        // ---- LEFT: High, Low, weekday — left-aligned ----
         display.setFont(&WeatherHL);
         display.setTextSize(1);
         drawTempAt((int)lroundf(w.hi), LEFT_X, HI_BASE);
         drawTempAt((int)lroundf(w.lo), LEFT_X, LO_BASE);
+
+        // ---- weekday of this reading, under Low (shares the condition font) ----
+        display.setFont(&WeatherCond);
+        display.setCursor(LEFT_X, DAY_BASE);
+        display.print(w.day);
 
         // ---- RIGHT: big current temp, right-aligned (Dimitri Swank) ----
         display.setFont(&WeatherBig);
@@ -424,8 +446,8 @@ void setup() {
         sleepAndRepeat();
     }
     w.city = city;
-    Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  @ %s\n",
-                  w.temp, w.hi, w.lo, w.code, w.updated.c_str());
+    Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  @ %s %s\n",
+                  w.temp, w.hi, w.lo, w.code, w.day.c_str(), w.updated.c_str());
 
     renderWeather(w);
     sleepAndRepeat();
