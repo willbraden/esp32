@@ -76,6 +76,6 @@ secret. Full procedure and safeguards:
 
 ## Known issues
 
-An lwIP `pbuf_free` crash hits about 1 in 3 boots right after the location lookup (it reboots
-and tries again, so the screen still updates), and a rare wedge after a software reboot
-leaves the board frozen until it's power-cycled. Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).
+Over-the-air updates can still fail their first boot and roll back (the restart is treated
+like a power-on), and the USB serial link sometimes dies while the firmware keeps running
+(tap RESET to get it back). Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).

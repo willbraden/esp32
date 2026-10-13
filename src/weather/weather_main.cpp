@@ -143,33 +143,39 @@ static const char* labelOf(int c) {
 }
 
 // ----- HTTP helper -----
-static String httpGet(const String& url, bool secure) {
+// One GET over a client the caller owns. The HTTPClient lives only in here, so
+// it is always destroyed before the client: ~HTTPClient() calls stop() on its
+// client whenever end() kept the connection for reuse, and a client destroyed
+// first is a use-after-free. That was the long-standing "pbuf_free: p->ref > 0"
+// crash: httpGet() used to declare the HTTPClient before a stack WiFiClient, so
+// every plain-HTTP request ended by writing into freed heap memory, which lwIP
+// tripped over moments later (netstress v3: 28 of 30 boots).
+static String fetch(NetworkClient& client, const String& url, const char* what) {
     HTTPClient http;
+    http.setReuse(false);   // one request per connection: end() really closes it
     String body;
-    if (secure) {
-        // Static so the TLS client outlives the HTTPClient teardown cleanly
-        // (avoids lwIP pbuf double-free asserts seen with stack-scoped clients).
-        static WiFiClientSecure c;
-        c.setCACertBundle(ca_bundle_start, ca_bundle_size());   // real cert validation
-        if (http.begin(c, url)) {
-            http.setTimeout(9000);
-            int code = http.GET();
-            if (code == 200) body = http.getString();
-            else Serial.printf("HTTP %d (secure) %s\n", code, url.c_str());
-            http.end();
-        }
-        c.stop();
-    } else {
-        WiFiClient c;
-        if (http.begin(c, url)) {
-            http.setTimeout(9000);
-            int code = http.GET();
-            if (code == 200) body = http.getString();
-            else Serial.printf("HTTP %d %s\n", code, url.c_str());
-            http.end();
-        }
+    if (http.begin(client, url)) {
+        http.setTimeout(9000);
+        int code = http.GET();
+        if (code == 200) body = http.getString();
+        else Serial.printf("HTTP %d (%s) %s\n", code, what, url.c_str());
+        http.end();
     }
     return body;
+}
+
+static String httpGet(const String& url, bool secure) {
+    if (secure) {
+        // Static: one TLS context for the life of the boot instead of a fresh
+        // allocation per request.
+        static WiFiClientSecure c;
+        c.setCACertBundle(ca_bundle_start, ca_bundle_size());   // real cert validation
+        String body = fetch(c, url, "secure");
+        c.stop();
+        return body;
+    }
+    WiFiClient c;
+    return fetch(c, url, "plain");
 }
 
 // ----- data fetch -----

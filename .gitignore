@@ -11,3 +11,6 @@ data/get-platformio.py
 # editor swap files
 *.swp
 *.swo
+
+# python bytecode
+__pycache__/

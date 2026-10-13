@@ -95,7 +95,13 @@ void confirmHealthy() {
 // GET url, following GitHub's redirect to its asset host. https URLs are
 // certificate-checked against the embedded root bundle; plain http is allowed
 // for a local staging server (the signature still protects the image).
+//
+// Callers must declare the clients BEFORE the HTTPClient so the clients outlive
+// it: ~HTTPClient() calls stop() on its client whenever end() kept the
+// connection for reuse, and a client destroyed first is a use-after-free that
+// corrupts the heap (it surfaced as lwIP's "pbuf_free: p->ref > 0" assert).
 static int beginGet(HTTPClient& http, NetworkClientSecure& tls, NetworkClient& plain, const String& url) {
+    http.setReuse(false);   // one request per connection: end() really closes it
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setTimeout(15000);
     bool ok;
@@ -136,7 +142,8 @@ Result checkAndInstall(void (*onInstalling)(const char* version)) {
     // 1. Manifest
     String body;
     {
-        HTTPClient http; NetworkClientSecure tls; NetworkClient plain;
+        NetworkClientSecure tls; NetworkClient plain;   // before http: they must outlive it
+        HTTPClient http;
         int code = beginGet(http, tls, plain, OTA_CHANNEL_URL);
         if (code == 404) {
             Serial.println("OTA: no release on this channel yet");
@@ -192,7 +199,8 @@ Result checkAndInstall(void (*onInstalling)(const char* version)) {
                   version.c_str(), FW_VERSION, (unsigned)size, target->label);
     if (onInstalling) onInstalling(version.c_str());
 
-    HTTPClient http; NetworkClientSecure tls; NetworkClient plain;
+    NetworkClientSecure tls; NetworkClient plain;       // before http: they must outlive it
+    HTTPClient http;
     int code = beginGet(http, tls, plain, url);
     if (code != 200 || (http.getSize() >= 0 && (size_t)http.getSize() != size)) {
         Serial.printf("OTA: download failed (%d, %d bytes)\n", code, http.getSize());

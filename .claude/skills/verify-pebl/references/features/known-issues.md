@@ -4,34 +4,44 @@ Open bugs with their evidence, and resolved ones that could come back.
 
 ## Sub-features
 
-### OPEN: lwIP `pbuf_free: p->ref > 0` crash, mostly on the first requests after a boot
+### FIXED: lwIP `pbuf_free: p->ref > 0` crash (2026-10-13)
 
-**Not fixed.** The platform upgrade to 55.03.311 (arduino-esp32 3.3.11, IDF 5.5.5) removed it from steady-state loops (0 in 90 requests in one boot, vs 10 in 55 on the old core) but the weather firmware still crashed on roughly 1 in 3 boots on the new core (2026-10-12, staging OTA test, 1-minute wakes). On 2026-10-13 a fresh flash crashed on **4 of 6 boots** (boot log #1–#7), all at `path=boot>wifi>loc`. Each crash costs a reboot; the screen still updates. Wi-Fi is also much slower on the boot after a crash: 7.6 s and 12.6 s against 1.6 s from a clean start. **It matters for OTA:** a crash during an update's trial boot rolls the update back (hence 3 attempts before a version is skipped).
+**Root cause: a use-after-free in our own `httpGet()`.** It declared `HTTPClient http` before a stack `WiFiClient c`, so C++ destroyed `c` first. ip-api answers HTTP/1.1 keep-alive, so `http.end()` kept the connection "for reuse" and left `http._client` pointing at `c`. Then `~HTTPClient()` called `_client->stop()` on the destroyed client, which wrote `sockfd = -1` into freed heap memory and released its two `shared_ptr` control blocks a second time. That corrupts the heap allocator, and lwIP allocates its packet buffers from the same heap, so lwIP's thread hit a doubly-owned `pbuf` on the next network activity. The HTTPS path never crashed because its client is `static`. `src/weather/ota.cpp` had the same declaration order in both the manifest fetch and the firmware download.
 
-Ruled out so far: TLS (HTTPS alone never crashed), `HTTPClient` socket reuse, PSRAM buffer placement (WiFi uses static copy buffers), source-port reuse across reboots (ports are already random: 59079, 62551, 53983, ...). Next experiment: one round per boot (`pebl_netstress` v2), varying what runs first after WiFi connects.
+Fix: the `HTTPClient` now lives inside `fetch(NetworkClient&, ...)`, so it is always destroyed before the client it points at; `ota.cpp` declares its clients first. Both also call `setReuse(false)` (every request is one-shot). **Rule: a client passed to `HTTPClient::begin()` must outlive the `HTTPClient`.**
 
-History:
+Evidence (`pebl_netstress`, one request per boot, 30 boots per phase, 2026-10-13):
 
-- Symptom: `assert failed: pbuf_free ... pbuf.c:755 (pbuf_free: p->ref > 0)`, then `Rebooting...`. In the weather firmware it fires right after `Loc:`. Up to 3 crashes in a row were seen before a boot got through.
-- Decoded stack (same both times): `tcpip_thread → ethernet_input → ip4_input → tcp_input → tcp_process → tcp_receive → tcp_free_acked_segments → tcp_seg_free → pbuf_free`. lwIP's own thread frees a sent segment that was already freed.
-- Isolation (`pebl_netstress`, arduino-esp32 3.3.2 / ESP-IDF 5.5.1): plain HTTP to ip-api 4/20 crashed, HTTPS to Open-Meteo 0/20, both in sequence 6/15. TLS is not the trigger; the plain `WiFiClient` path is.
-- Ruled out: `HTTPClient` socket reuse. With `http.setReuse(false)` (`HTTP_NO_REUSE 1` in netstress) the second request still crashed.
-- Core version: the old core crashed in steady state too; 3.3.11 / IDF 5.5.5 ran 90 of 90 in one boot. Keep the newer platform, but it did not fix the after-boot crash.
-- Also seen once on the old core: after the 11th crash in a stress run, USB stopped answering auto-reset (the red LED was off; replugging fixed it). Needed the BOOT sequence.
+| Run | Phase | Crashes |
+|---|---|---|
+| v3.1 | old code, plain HTTP | 28/30, all in the restart after the request |
+| v3.1 | HTTPS only | 0/30 |
+| v3.1 | old code, plain HTTP, 3 s after Wi-Fi | 23/30 (not a timing race) |
+| v3.1 | old code, HTTP then HTTPS (the weather sequence) | 18/30, all at the next HTTPS request |
+| v4 | old code (control) | 24/30 |
+| v4 | fixed | **0/30** |
+| v4 | fixed, HTTP then HTTPS | **0/30** |
+| v4 | fixed ordering only, keep-alive on | **0/30** (ordering alone is the fix) |
 
-### OPEN: board occasionally wedges after a software reboot
+Before the fix the weather firmware crashed on 4 of 6 boots (boot log, 2026-10-13), always right after `Loc:`, and the crash rolled OTA updates back.
 
-Seen twice in ~150 reboots on 2026-10-12, both right after `rst:0xc (RTC_SW_CPU_RST)` (a panic reboot and an `ESP.restart()`). The ROM line prints, then nothing; USB still enumerates but esptool gets "No serial data received". The red LED was off the first time. Only a USB replug brought it back. Cause unknown. If it hits on battery, the device stays frozen until power is cycled. OTA installs end in `ESP.restart()`, so this needs fixing before relying on unattended updates.
+Earlier wrong turns, kept so nobody repeats them: the 55.03.311 platform upgrade, TLS, PSRAM, source-port reuse and "HTTPClient reuse" (an old-core test with `setReuse(false)` still crashed; that core had a second steady-state crash, which confounded it) were all chased first. The decoded stack (`tcpip_thread → tcp_input → tcp_receive → tcp_free_acked_segments → pbuf_free`) only shows where the corruption was noticed, not who caused it. Espressif's maintainers say the same of this assert: look for memory corruption elsewhere.
+
+### OPEN: the USB serial/JTAG link dies while the firmware keeps running
+
+This is what earlier notes called "the board wedges after a software reboot". **The chip does not hang.** On 2026-10-13 a "wedged" board kept answering pings in netstress's connect/restart rhythm, and later turned out to have finished all 120 rounds, while USB gave nothing: no serial, `esptool` "No serial data received" even with a USB reset, and OpenOCD `libusb_get_string_descriptor_ascii() failed`. macOS still lists the device because it cached the descriptors. The ESP32-S3's USB serial/JTAG peripheral deliberately survives CPU resets (so a debugger stays attached), so once stuck it stays stuck through every `ESP.restart()` and panic. Only RESET (or a USB replug) clears it.
+
+Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
 ### OPEN: OTA updates fail their trial boot
 
-`weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (2026-10-13; NVS `pebl-ota/bad_cnt=3`, read with esptool). It reached the device by USB instead and runs fine. One failed trial was photographed: Wi-Fi didn't connect after the install restart, the firmware treated the restart as a power-on and opened the 180 s setup portal, then slept unconfirmed, which counts as a rollback. The other two left no evidence (the boot log didn't exist yet). Three design flaws turn the crash and slow post-restart Wi-Fi above into failed updates:
+`weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (2026-10-13; NVS `pebl-ota/bad_cnt=3`, read with esptool). It reached the device by USB instead and runs fine. One failed trial was photographed: Wi-Fi didn't connect after the install restart, the firmware treated the restart as a power-on and opened the 180 s setup portal, then slept unconfirmed, which counts as a rollback. The other two left no evidence (the boot log didn't exist yet), but the `pbuf_free` crash above hit right after `Loc:` on most boots, and the OTA code's own manifest fetch and download had the same use-after-free. Both are fixed. Three design flaws remain, and they still turn any trial-boot failure (slow Wi-Fi after a restart, a router blip) into a failed update:
 
 - The trial boot treats `sw-restart` like a power-on: it opens the setup portal instead of behaving as an unattended wake.
 - A rollback boot is a cold boot, and cold boots check for updates at once, so all 3 attempts burn within minutes.
 - Any failure on the trial boot (network included) rolls the image back, not just failures the image caused.
 
-Until these and the crash are fixed, expect most OTA releases to need a USB flash.
+Until these are fixed (step 3 of the 2026-10-13 OTA plan), treat OTA as unreliable and prove each release on the device.
 
 ### RESOLVED: double full refresh on every wake
 
@@ -43,12 +53,13 @@ Until these and the crash are fixed, expect most OTA releases to need a USB flas
 
 ## How to get to it (user POV)
 
-The crash shows up only as a slower update (extra reboots before the screen changes). The wedge shows up as a screen that stops updating, same as a dead battery.
+Before the fix, the crash showed up as a slower update (extra reboots before the screen changed) and as OTA updates that rolled back. The USB link failure isn't visible to the user at all; the panel keeps updating.
 
 ## Driving it
 
-- Regression check after any platform or network-code change: flash `pebl_netstress`, attach one logger for the whole run, and require 0 crashes in all three phases (30 rounds each). The old baseline was ~18% per HTTP request.
-- Then a clean `pebl_weather` boot log with no `assert failed` / `Rebooting...`.
+- Regression check after any platform or network-code change: flash `pebl_netstress` (v4), let it run all 120 boots (~10 min; it doesn't need USB), then read `tools/boot_log.py --ns netstress` in download mode. Phase 0 (the old code, kept as a control) should still crash on most boots; phases 1-3 must show 0.
+- Then the weather firmware's boot log over many wakes: no record with `next-boot=PANIC`.
+- Any new `HTTPClient` code: the client object must be declared before the `HTTPClient` (or the `HTTPClient` confined to a helper like `fetch()`).
 
 ## Gotchas
 

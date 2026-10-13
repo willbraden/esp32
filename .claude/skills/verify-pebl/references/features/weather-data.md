@@ -35,4 +35,4 @@ Derived values:
 - `current.time` is the start of a 15-minute slot, so "@ 10:15 PM" can be up to 15 minutes old.
 - `precipitation_probability` can be null for some hours or models. Parsing defaults to 0.
 - ip-api is plain HTTP and rate-limited (45/min). The stress test stays well under that.
-- The `pbuf_free` crash fires right after this lookup on about 1 in 3 boots (open). See `known-issues.md`.
+- This lookup is the only plain-HTTP request. Its client used to be destroyed before its `HTTPClient`, which corrupted the heap and crashed lwIP right after `Loc:` (fixed 2026-10-13; `known-issues.md`). Keep the client outliving the `HTTPClient`.

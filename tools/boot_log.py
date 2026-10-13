@@ -8,6 +8,8 @@ runs for a moment, because it reads NVS, not the console.
     ~/.platformio/penv/bin/python tools/boot_log.py
     # or decode a dump you already have (esptool read_flash 0x9000 0x5000 nvs.bin):
     ~/.platformio/penv/bin/python tools/boot_log.py --dump nvs.bin
+    # a diagnostic's results too:
+    ~/.platformio/penv/bin/python tools/boot_log.py --ns netstress
 
 Reading leaves the chip in download mode. Start it again with one RESET tap,
 or: esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id
@@ -25,6 +27,7 @@ NVS_OFFSET, NVS_SIZE = 0x9000, 0x5000      # partitions.csv
 PAGE, ENTRY = 4096, 32
 T_U8, T_U32, T_STR = 0x01, 0x04, 0x21
 NAMESPACES = ("pebl-boot", "pebl-ota", "pebl-weather")
+SECRET_NAMESPACES = ("nvs.net80211",)   # the WiFi driver's store: SSID, password, PMK
 
 
 def read_nvs(dump):
@@ -57,7 +60,7 @@ def read_nvs(dump):
                     body = page[64 + (i + 1) * ENTRY:64 + (i + span) * ENTRY]
                     val = body[:size].rstrip(b"\0").decode("utf-8", "replace")
                 else:
-                    val = data.hex()
+                    val = bytes(data)                 # blob or other type: not decoded
                 if ns == 0 and typ == T_U8:
                     ns_names[val] = key
                 else:
@@ -89,6 +92,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dump", help="decode this NVS image instead of reading the board")
     ap.add_argument("--port", help="serial port (default: first /dev/cu.usbmodem*)")
+    ap.add_argument("--ns", action="append", default=[], metavar="NAME",
+                    help="also print this namespace's numbers and strings, e.g. --ns netstress")
     a = ap.parse_args()
 
     if a.dump:
@@ -117,6 +122,13 @@ def main():
     w = nvs.get("pebl-weather", {})
     if "mode" in w:
         print(f"screen mode: {w['mode']} ({'word' if w['mode'] == 1 else 'numbers'})")
+    for ns in a.ns:
+        if ns in SECRET_NAMESPACES:
+            sys.exit(f"refusing to print {ns}: it holds WiFi credentials")
+        vals = {k: v for k, v in nvs.get(ns, {}).items() if isinstance(v, (int, str))}
+        print(f"{ns}:" + ("" if vals else " (empty)"))
+        for k, v in sorted(vals.items()):
+            print(f"  {k} = {v}")
 
 
 if __name__ == "__main__":

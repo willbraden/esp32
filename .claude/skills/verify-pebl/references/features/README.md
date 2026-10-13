@@ -52,7 +52,7 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 
 ## Open problems and legacy
 
-- [known-issues](known-issues.md): Open bugs with evidence (the lwIP `pbuf_free` crash after boot, the post-reboot wedge) and resolved ones that could come back.
+- [known-issues](known-issues.md): Open bugs with evidence (the USB link dying, OTA trial boots failing) and fixed ones that could come back (the `pbuf_free` crash).
 - [legacy-wifi-tooling](legacy-wifi-tooling.md): The original client's multi-network WiFi and QR provisioning code, kept unbuilt as reference, and what a port must change.
 
 ## Multi-surface journeys
