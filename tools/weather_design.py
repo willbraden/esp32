@@ -29,34 +29,39 @@ from PIL import Image, ImageDraw
 # Font files (any .ttf). Swap these to try a totally different typeface.
 FONT_BIG  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # big current temp
 FONT_HL   = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # Hi / Lo
-FONT_COND = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # condition word + weekday
+FONT_COND = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # condition word
+FONT_DAY  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # weekday letters in the bar
 
 # Glyph height in pixels for each element (bigger = bigger text).
-H_BIG  = 76   # current temp
-H_HL   = 28   # Hi / Lo
-H_COND = 21   # condition word
+# Sized so the WORST case below keeps >= 8px between neighbours (width-bound:
+# a 3-digit Hi next to a 3-digit current temp is exactly 8px apart).
+H_BIG  = 59   # current temp
+H_HL   = 37   # Hi / Lo
+H_COND = 17   # condition word
+H_DAY  = 11   # weekday letters (cap height)
 
 # Layout positions (must match the LAYOUT KNOBS in weather_main.cpp).
 # Screen is 250 wide x 122 tall. y values are text BASELINES.
-# NOTE: baselines depend on the font's below-baseline extent. Plain sans (Arial)
-# has ~none, so the temp sits at CUR_BASE=84. A beveled/3-D font that overhangs
-# below the baseline needs a smaller CUR_BASE to leave a gap above the condition.
-LEFT_X    = 8        # Hi/Lo left edge
+# Both columns are 84px tall and centred: tops at y=19, bottoms at y=103.
+BAR_W     = 19       # inverted weekday bar on the left edge (full height)
+DAY_GAP   = 8        # vertical gap between stacked weekday letters
+LEFT_X    = BAR_W + 8  # Hi/Lo left edge
 RIGHT_X   = 250 - 8  # right edge that the temp + condition align to
-HI_BASE   = 36       # Hi baseline
-LO_BASE   = 75       # Lo baseline
-CUR_BASE  = 84       # current-temp baseline
-COND_BASE = 114      # condition baseline
-DAY_BASE  = 114      # weekday baseline (left, under Lo; shares the condition row)
-# Left column (Hi, Lo, day) sits on an even 39px baseline grid: 36 / 75 / 114.
+HI_BASE   = 56       # Hi baseline   (top aligned with the big temp's top)
+LO_BASE   = 103      # Lo baseline   (aligned with the condition baseline)
+CUR_BASE  = 78       # current-temp baseline
+COND_BASE = 103      # condition baseline
 
 # What to show in the preview (change to test different values / longest words).
-PREVIEW = dict(hi="102", lo="89", cur="98", cond="Cloudy", day="Wed")
+PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON")
+# Worst cases checked for collisions on every run.
+WORST = dict(nums=["108", "-18"], conds=["Cloudy", "Storm", "Clear", "Rain", "Snow", "Fog"],
+             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
 # ========================================================================
 
 DPI = 141                       # matches Adafruit fontconvert
 FIRST, LAST = 0x20, 0x7E        # printable ASCII
-STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond")
+STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond", day="WeatherDay")
 HEADER  = "src/weather/weather_fonts.h"
 PREVIEW_PNG = "tools/preview.png"
 
@@ -114,33 +119,80 @@ def text_w(f, s):
     return sum(f['glyphs'][ord(c) - FIRST]['xadv'] for c in s)
 
 
-def blit(draw, f, s, penx, baseline):
+def ink(f, s):
+    """(x1, w) ink extent of s drawn at pen x=0 — same as Adafruit getTextBounds."""
+    pen, lo, hi = 0, None, None
+    for c in s:
+        g = f['glyphs'][ord(c) - FIRST]
+        if g['w']:
+            lo = pen + g['xoff'] if lo is None else min(lo, pen + g['xoff'])
+            hi = pen + g['xoff'] + g['w'] if hi is None else max(hi, pen + g['xoff'] + g['w'])
+        pen += g['xadv']
+    return (lo or 0), ((hi - lo) if lo is not None else 0)
+
+
+def right_pen(f, s):
+    """Pen x that puts the ink's right edge on RIGHT_X (mirrors the firmware)."""
+    x1, w = ink(f, s)
+    return RIGHT_X - w - x1
+
+
+def blit(draw, f, s, penx, baseline, fill=0):
     for c in s:
         g = f['glyphs'][ord(c) - FIRST]
         for y in range(g['h']):
             for x in range(g['w']):
                 if g['bits'][y * g['w'] + x]:
-                    draw.point((penx + g['xoff'] + x, baseline + g['yoff'] + y), fill=0)
+                    draw.point((penx + g['xoff'] + x, baseline + g['yoff'] + y), fill=fill)
         penx += g['xadv']
+
+
+def day_layout(day, f):
+    """(penx, baseline) per letter: each centred in the bar, stack centred vertically.
+    Mirrors drawDayBar() in weather_main.cpp."""
+    total = len(day) * H_DAY + (len(day) - 1) * DAY_GAP
+    top = (122 - total) // 2
+    out = []
+    for i, c in enumerate(day):
+        g = f['glyphs'][ord(c) - FIRST]
+        out.append(((BAR_W - g['w']) // 2 - g['xoff'], top + i * (H_DAY + DAY_GAP) + H_DAY))
+    return out
+
+
+def check(big, hl, cond, day):
+    """Print the tightest gaps for the worst-case strings."""
+    hlRight = max(LEFT_X + sum(ink(hl, n)) for n in WORST['nums'])      # ink right edge
+    bigLeft = min(right_pen(big, n) + ink(big, n)[0] for n in WORST['nums'])
+    cndLeft = min(right_pen(cond, c) + ink(cond, c)[0] for c in WORST['conds'])
+    wDay = max(day['glyphs'][ord(c) - FIRST]['w'] for d in WORST['days'] for c in d)
+    print(f"worst gaps: Hi->big {bigLeft - hlRight}px, "
+          f"Lo->cond {cndLeft - hlRight}px, "
+          f"Hi->Lo {LO_BASE - H_HL - HI_BASE}px, big->cond {COND_BASE - H_COND - CUR_BASE}px, "
+          f"day letter margin {(BAR_W - wDay) / 2:.1f}px")
 
 
 def main():
     big  = convert(FONT_BIG,  STRUCTS['big'],  H_BIG)
     hl   = convert(FONT_HL,   STRUCTS['hl'],   H_HL)
     cond = convert(FONT_COND, STRUCTS['cond'], H_COND)
+    day  = convert(FONT_DAY,  STRUCTS['day'],  H_DAY)
 
     with open(HEADER, "w") as fh:
         fh.write("#pragma once\n#include <Adafruit_GFX.h>\n\n"
-                 + emit(big) + "\n\n" + emit(hl) + "\n\n" + emit(cond) + "\n")
+                 + emit(big) + "\n\n" + emit(hl) + "\n\n" + emit(cond) + "\n\n"
+                 + emit(day) + "\n")
     print(f"wrote {HEADER}  (BIG {len(big['bitmaps'])}B, HL {len(hl['bitmaps'])}B, "
-          f"COND {len(cond['bitmaps'])}B)")
+          f"COND {len(cond['bitmaps'])}B, DAY {len(day['bitmaps'])}B)")
+    check(big, hl, cond, day)
 
     img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)   # e-ink gray
+    d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
+    for c, (x, y) in zip(PREVIEW['day'], day_layout(PREVIEW['day'], day)):
+        blit(d, day, c, x, y, fill=236)
     blit(d, hl,   PREVIEW['hi'], LEFT_X, HI_BASE)
     blit(d, hl,   PREVIEW['lo'], LEFT_X, LO_BASE)
-    blit(d, cond, PREVIEW['day'], LEFT_X, DAY_BASE)
-    blit(d, big,  PREVIEW['cur'],  RIGHT_X - text_w(big,  PREVIEW['cur']),  CUR_BASE)
-    blit(d, cond, PREVIEW['cond'], RIGHT_X - text_w(cond, PREVIEW['cond']), COND_BASE)
+    blit(d, big,  PREVIEW['cur'],  right_pen(big,  PREVIEW['cur']),  CUR_BASE)
+    blit(d, cond, PREVIEW['cond'], right_pen(cond, PREVIEW['cond']), COND_BASE)
     img.point(lambda x: 0 if x < 128 else 236).resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)
     print(f"wrote {PREVIEW_PNG}  (open it to see the layout)")
 

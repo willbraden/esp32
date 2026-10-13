@@ -56,7 +56,7 @@ struct Weather {
     int    code = 0;
     String city = "";
     String updated = "";   // "3:45 PM"
-    String day = "";       // "Mon" — location-local weekday of the reading
+    String day = "";       // "MON" — location-local weekday of the reading
 };
 
 // Icon categories derived from WMO weather codes
@@ -156,7 +156,7 @@ static String to12h(const String& hm) {        // "15:45" -> "3:45 PM"
 
 // Three-letter weekday for a Gregorian date (Sakamoto's method).
 static const char* weekdayAbbr(int y, int m, int d) {
-    static const char* const names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char* const names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     static const int offs[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
     if (m < 1 || m > 12 || d < 1 || d > 31) return "";
     if (m < 3) y--;
@@ -273,7 +273,7 @@ static const char* shortLabelOf(int code) {
         case CAT_FOG:    return "Fog";
         case CAT_RAIN:   return "Rain";
         case CAT_SNOW:   return "Snow";
-        case CAT_STORM:  return "Storm";  // short enough to share the row with the weekday
+        case CAT_STORM:  return "Storm";  // "Thunderstorm" would collide with a 3-digit Low
     }
     return "—";
 }
@@ -293,17 +293,40 @@ static void drawTempAt(int val, int leftX, int baseY) {
     display.print(b);
 }
 
+// Inverted weekday bar on the left edge: white letters stacked top-to-bottom,
+// each centred in the bar, the stack centred vertically. Mirrors day_layout()
+// in tools/weather_design.py.
+static void drawDayBar(const String& day, int barW, int capH, int gap) {
+    int H = display.height();
+    display.fillRect(0, 0, barW, H, GxEPD_BLACK);
+    display.setFont(&WeatherDay);
+    display.setTextColor(GxEPD_WHITE);
+    int n = day.length();
+    int top = (H - (n * capH + (n - 1) * gap)) / 2;
+    for (int i = 0; i < n; i++) {
+        char c[2] = {day[i], 0};
+        int16_t bx, by; uint16_t bw, bh;
+        display.getTextBounds(c, 0, 0, &bx, &by, &bw, &bh);
+        display.setCursor((barW - (int)bw) / 2 - bx, top + i * (capH + gap) + capH);
+        display.print(c);
+    }
+    display.setTextColor(GxEPD_BLACK);
+}
+
 static void renderWeather(const Weather& w) {
     int W = display.width();
-    // ---- LAYOUT KNOBS ----
-    const int LEFT_X    = 8;        // HI/LO are left-aligned to here
-    const int RIGHT_X   = W - 8;    // current temp + condition are right-aligned to here
-    const int HI_BASE   = 36;       // baseline y of the High temp (left, upper)
-    const int LO_BASE   = 75;       // baseline y of the Low temp  (left, middle)
-    const int CUR_BASE  = 84;       // baseline y of the big current temp (right)
-    const int COND_BASE = 114;      // baseline y of the condition word (right)
-    const int DAY_BASE  = 114;      // baseline y of the weekday (left, bottom)
-    // Left column (Hi, Lo, day) is on an even 39px baseline grid: 36 / 75 / 114.
+    // ---- LAYOUT KNOBS (keep in sync with tools/weather_design.py) ----
+    // Sized so the worst case (3-digit Hi next to a 3-digit current temp) keeps
+    // 8px between them. Both columns are 84px tall and centred (y=19..103).
+    const int BAR_W     = 19;           // inverted weekday bar (full height, left edge)
+    const int DAY_CAP   = 11;           // weekday letter cap height (= H_DAY)
+    const int DAY_GAP   = 8;            // gap between stacked weekday letters
+    const int LEFT_X    = BAR_W + 8;    // Hi/Lo are left-aligned to here
+    const int RIGHT_X   = W - 8;        // current temp + condition are right-aligned to here
+    const int HI_BASE   = 56;           // High baseline (top aligned with the big temp's top)
+    const int LO_BASE   = 103;          // Low baseline  (aligned with the condition baseline)
+    const int CUR_BASE  = 78;           // big current temp baseline (right)
+    const int COND_BASE = 103;          // condition word baseline (right)
 
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
@@ -312,18 +335,16 @@ static void renderWeather(const Weather& w) {
         display.fillScreen(GxEPD_WHITE);
         int16_t bx, by; uint16_t bw, bh;
 
-        // ---- LEFT: High, Low, weekday — left-aligned ----
+        // ---- weekday of this reading, so a stale screen (dead battery) is obvious ----
+        drawDayBar(w.day, BAR_W, DAY_CAP, DAY_GAP);
+
+        // ---- LEFT: High over Low, left-aligned ----
         display.setFont(&WeatherHL);
         display.setTextSize(1);
         drawTempAt((int)lroundf(w.hi), LEFT_X, HI_BASE);
         drawTempAt((int)lroundf(w.lo), LEFT_X, LO_BASE);
 
-        // ---- weekday of this reading, under Low (shares the condition font) ----
-        display.setFont(&WeatherCond);
-        display.setCursor(LEFT_X, DAY_BASE);
-        display.print(w.day);
-
-        // ---- RIGHT: big current temp, right-aligned (Dimitri Swank) ----
+        // ---- RIGHT: big current temp, right-aligned ----
         display.setFont(&WeatherBig);
         display.setTextSize(1);
         char cbuf[8]; snprintf(cbuf, sizeof(cbuf), "%d", (int)lroundf(w.temp));
@@ -331,7 +352,7 @@ static void renderWeather(const Weather& w) {
         display.setCursor(RIGHT_X - bw - bx, CUR_BASE);
         display.print(cbuf);
 
-        // ---- condition word, right-aligned under the temp (Dimitri Swank) ----
+        // ---- condition word, right-aligned under the temp ----
         display.setFont(&WeatherCond);
         const char* lab = shortLabelOf(w.code);
         display.getTextBounds(lab, 0, 0, &bx, &by, &bw, &bh);
