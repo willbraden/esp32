@@ -34,6 +34,7 @@ Markers in order for one wake (`src/weather/weather_main.cpp`):
 | `Loc: <city> (<lat>, <lon>)` | ip-api lookup worked |
 | `Temp T  Hi H  Lo L  code C  precip6h P% [(snow)]  @ DAY time` | The reading every screen is drawn from |
 | `_Update_Full : <µs>` | One full panel refresh (~2.3 s). **Exactly one per render** |
+| `Drew <screen>: panel busy Nms, usb host/none` | The same refresh as the boot log records it (`numbers`, `word` or `msg`) |
 | `Sleeping Ns (or until USER SW)...` | Entering deep sleep; the port drops right after |
 
 Reset reasons:
@@ -58,6 +59,7 @@ Boot log (one line per boot, last 16 kept in NVS `pebl-boot`):
 | `wifi` | Time spent on the direct reconnect (25 s = timed out) |
 | `fail` | `wifi`, `wifi+portal`, `wifi+portal-timeout`, `loc`, `weather` |
 | `ota` | Update check result: `up-to-date`, `no-channel`, `skipped-bad`, `failed`, `installing-<ver>` |
+| `draw`, `usb` | Each panel refresh: screen (`numbers`, `word`, `msg`) and how long the panel held BUSY. ~2300 ms is a real full refresh; near 0 means the panel never ran it (no power, or SPI didn't reach it); `TIMEOUT` means it hung. `usb=host` if a computer was talking to the USB port at the last draw, `none` on battery or a charger |
 | `trial`, `rolled-back-from=<ver>(attempt-n/3)` | First boot of an OTA update; the boot right after a rollback |
 | `next-boot` | Reset reason of the following boot. `PANIC` / `*-WDT` = this boot crashed at the end of its path; `sw-restart` = OTA install restart; `deep-sleep` = normal wake; `power-on` = RESET or power cycle; `usb-reset` = esptool or a logger reopening the port. Missing = no boot since |
 

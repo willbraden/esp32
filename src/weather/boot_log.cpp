@@ -24,6 +24,8 @@ static struct {
     char     fail[24];
     char     ota[32];
     char     notes[192]; // comma-separated: retries, faults, trial failures, rollback
+    char     draws[64];  // comma-separated screen refreshes: numbers:3502ms,...
+    int8_t   usbHost;    // at the last draw: -1 unknown, 0 none, 1 attached
     int32_t  wifiMs;
 } s = {};
 
@@ -64,7 +66,7 @@ static void add(char* buf, size_t size, size_t& n, const char* fmt, ...) {
 
 static void write() {
     if (!s.started) return;
-    char line[512];   // worst case is ~440 chars
+    char line[600];   // worst case is ~520 chars
     size_t n = 0;
     add(line, sizeof(line), n, "#%lu v%s wake=%s path=%s up=%.1fs",
         (unsigned long)s.seq, FW_VERSION, s.wake, s.path, millis() / 1000.0);
@@ -73,6 +75,7 @@ static void write() {
     if (s.ota[0])       add(line, sizeof(line), n, " ota=%s", s.ota);
     if (s.trial)        add(line, sizeof(line), n, " trial");
     if (s.longPress)    add(line, sizeof(line), n, " long-press");
+    if (s.draws[0])     add(line, sizeof(line), n, " draw=%s usb=%s", s.draws, s.usbHost ? "host" : "none");
     if (s.notes[0])     add(line, sizeof(line), n, " notes=%s", s.notes);
     if (s.rollback[0])  add(line, sizeof(line), n, " rolled-back-from=%s", s.rollback);
     Preferences p;
@@ -117,6 +120,7 @@ void begin(bool trial, const char* rollbackFrom) {
     strlcpy(s.rollback, rollbackFrom ? rollbackFrom : "", sizeof(s.rollback));
     strlcpy(s.path, "boot", sizeof(s.path));
     s.wifiMs = -1;
+    s.usbHost = -1;
     write();
 }
 
@@ -132,6 +136,17 @@ void longPress()                { s.longPress = true; write(); }
 void note(const char* what) {
     if (s.notes[0]) strlcat(s.notes, ",", sizeof(s.notes));
     strlcat(s.notes, what, sizeof(s.notes));
+    write();
+}
+
+void draw(const char* what, uint32_t busyMs, bool usbHost) {
+    // GxEPD2 stops waiting after 10 s; anything near that is a timeout.
+    char d[24];
+    if (busyMs >= 9900) snprintf(d, sizeof(d), "%s:TIMEOUT", what);
+    else                snprintf(d, sizeof(d), "%s:%lums", what, (unsigned long)busyMs);
+    if (s.draws[0]) strlcat(s.draws, ",", sizeof(s.draws));
+    strlcat(s.draws, d, sizeof(s.draws));
+    s.usbHost = usbHost;
     write();
 }
 

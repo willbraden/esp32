@@ -73,6 +73,26 @@ enum Mode : uint8_t { MODE_NUMBERS = 0, MODE_WORD = 1, MODE_COUNT };
 GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>
     display(GxEPD2_213_B74(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 
+// ----- refresh meter: how long the panel held BUSY on each draw -----
+// A full refresh on this panel holds BUSY for ~2.3 s while it drives the
+// waveform. ~0 ms means the panel never ran the update (no power, or the
+// commands didn't reach it); 10 s means GxEPD2 gave up waiting. Each draw goes
+// into the boot log with that time and whether a USB host was attached, so a
+// blank or wrong screen in the field says which of those it was.
+static uint32_t panelBusyUs;
+static void onPanelBusy(const void*) {   // GxEPD2 calls this in its busy-wait loop
+    uint32_t t = micros();
+    delay(1);
+    panelBusyUs += micros() - t;
+}
+static void drawStart() { panelBusyUs = 0; }
+static void drawDone(const char* what) {
+    uint32_t ms = panelBusyUs / 1000;
+    bool usb = Serial.isPlugged();       // USB host sending frames (not a charger)
+    Serial.printf("Drew %s: panel busy %lums, usb %s\n", what, (unsigned long)ms, usb ? "host" : "none");
+    bootlog::draw(what, ms, usb);
+}
+
 // ----- weather model -----
 struct Weather {
     bool   ok = false;
@@ -423,12 +443,14 @@ static void renderWord(const Weather& w) {
     int x = WORD_BOX_X0 + (WORD_BOX_X1 - WORD_BOX_X0 - a.w) / 2;
     int y = WORD_BOX_Y0 + (WORD_BOX_Y1 - WORD_BOX_Y0 - a.h) / 2;
     display.setFullWindow();
+    drawStart();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
         drawDayBar(w.day, BAR_W, DAY_CAP, DAY_GAP);
         display.drawBitmap(x, y, a.bits, a.w, a.h, GxEPD_BLACK);
     } while (display.nextPage());
+    drawDone("word");
 }
 
 static void renderWeather(const Weather& w) {
@@ -445,6 +467,7 @@ static void renderWeather(const Weather& w) {
 
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
+    drawStart();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
@@ -474,12 +497,14 @@ static void renderWeather(const Weather& w) {
         display.setCursor(RIGHT_X - bw - bx, COND_BASE);
         display.print(lab);
     } while (display.nextPage());
+    drawDone("numbers");
 }
 
 static void renderMessage(const char* line1, const char* line2) {
     int W = display.width(), H = display.height();
     display.setTextColor(GxEPD_BLACK);
     display.setFullWindow();
+    drawStart();
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
@@ -493,6 +518,7 @@ static void renderMessage(const char* line1, const char* line2) {
             display.print(line2);
         }
     } while (display.nextPage());
+    drawDone("msg");
 }
 
 // ----- display bring-up -----
@@ -509,6 +535,7 @@ static void initDisplay() {
     // (writeImageForFullRefresh), so that extra clear only doubled the refresh.
     display.init(115200, false, 2, false);
     display.setRotation(3);   // landscape, flipped 180° from rotation 1
+    display.epd2.setBusyCallback(onPanelBusy);
     // CS doubles as USER SW: a press during a refresh shorts the driven-high pin
     // to GND, so drive it as weakly as possible to bound that current.
     gpio_set_drive_capability(PIN_USER_SW, GPIO_DRIVE_CAP_0);

@@ -36,5 +36,9 @@ void ota(const char* result);          // e.g. "up-to-date", "installing-1.2.0"
 void wifiMs(uint32_t ms);              // time spent on the direct reconnect
 void longPress();
 void note(const char* what);           // appended, e.g. "wifi-retry-2", "rtc-fresh"
+// A finished screen refresh: which screen ("numbers", "word", "msg"), how long
+// the panel held BUSY (~2300 ms is a real full refresh), and whether a USB host
+// was attached at the time. Appended, so a boot that draws twice keeps both.
+void draw(const char* what, uint32_t busyMs, bool usbHost);
 
 }  // namespace bootlog

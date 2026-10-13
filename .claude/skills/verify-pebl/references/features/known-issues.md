@@ -33,6 +33,24 @@ This is what earlier notes called "the board wedges after a software reboot". **
 
 Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
+### OPEN: blank panel after the first draw of an OTA update
+
+`weather-v1.1.1`, 2026-10-13: the long press installed it (boot log #104 `ota=installing-1.1.1`), and its first boot (#105) fetched, drew (`path=...>drawn>ota>sleep`), checked (`ota=up-to-date`) and confirmed itself (otadata state `0x2` VALID). But the panel showed **pure white** instead of the weather. A fresh boot of the same image (watchdog reset, on USB) drew normally. The board was on battery during the update. Crash restarts earlier the same day were followed by normal draws, so a plain software restart isn't enough to cause it. What was different: a full refresh ("Updating firmware...") about 30 s before the restart, with the panel left powered, and battery power.
+
+Hypotheses: (1) the SSD1680 is left in a state the next init doesn't recover from, because the panel isn't powered off before the install restart; (2) the boost converter can't reach drive voltage on battery under Wi-Fi load right after the download, washing the image out.
+
+Not reproduced (2026-10-13, staging rig, `pebl_weather_staging` 1.3.0 -> 1.3.3, with the per-draw panel timing below). Three updates, each followed by a trial boot that drew the weather on the panel:
+
+| Update | Power | Download | Trial boot |
+|---|---|---|---|
+| 1.3.0 -> 1.3.1 | USB (Mac) | ~15 s, local HTTP | #114 `draw=numbers:2284ms usb=host`, weather on screen |
+| 1.3.1 -> 1.3.2 | battery | ~15 s, local HTTP | #118 `draw=numbers:2284ms usb=none`, weather on screen |
+| 1.3.2 -> 1.3.3 | battery | ~70 s, throttled to 24 KB/s like the GitHub download | #121 `draw=numbers:2284ms usb=none`, weather on screen |
+
+Every refresh in those runs, including each "Updating firmware..." screen, held BUSY for 2284 ms. Hypothesis (1) as stated is also weakened by the code: GxEPD2's `init()` pulses the panel's RST line on every boot. Still different from the real event: a TLS download from GitHub (CPU load as well as Wi-Fi), the long-press boot that started it, and the battery's charge at the time (this board has no battery sense, so it can't be logged).
+
+Since then every draw is in the boot log (`draw=<screen>:<ms> usb=host|none`, see `serial-diagnostics.md`). If it happens again, read the boot log before anything else: ~2300 ms on the blank boot means the panel ran a full refresh and the image or the drive voltage was wrong; near 0 means the panel never ran it; `TIMEOUT` means it hung.
+
 ### FIXED: OTA updates failed their trial boot (2026-10-13)
 
 `weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (NVS `pebl-ota/bad_cnt=3`); it reached the device by USB instead. Causes, all fixed:
@@ -50,7 +68,7 @@ Proof on the staging rig (`pebl_weather_fault`, 1-minute wakes, check every 3rd 
 | 1.2.1 | 1 | first attempt failed, retry connected, confirmed: the trial boot reached the server 26 s after the download and `try_ver` was cleared |
 | 1.2.2 | all | each attempt: 3 trial boots with `fail=wifi trial`, no portal, then self-rollback (`next-boot=sw-restart`); the next boot logged `rolled-back-from=1.2.2(attempt-n/3)` and did not check; attempts at 13:41, 13:49, 13:57 (one scheduled check between each); then `ota=skipped-bad` |
 
-Not yet proven on a real release through GitHub: do that with the next `weather-v*` tag.
+Proven through a real release: `weather-v1.1.1` installed from GitHub on a long press, and its trial boot confirmed itself first time (2026-10-13). (Its first draw came out blank; see the open issue above.)
 
 ### RESOLVED: double full refresh on every wake
 
