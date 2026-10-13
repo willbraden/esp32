@@ -6,7 +6,7 @@
 
 - font-convert: TTF → Adafruit GFX headers (`WeatherBig`, `WeatherHL`, `WeatherCond`, `WeatherDay`) in `src/weather/weather_fonts.h`. A Python port of fontconvert (DPI 141, `yOffset = 1 - bitmap_top`, MSB bit packing)
 - word-art: each word plus the sunglasses → `src/weather/weather_words.h` (Adafruit `drawBitmap` format)
-- previews: `tools/preview.png` (numbers screen, 4× scale) and `tools/preview_words.png` (all eight word screens)
+- previews: `tools/preview.png` and `tools/preview_night.png` (numbers screen, day and night, 4× scale) and `tools/preview_words.png` (all eight word screens, day left, night right)
 - gap-check: prints worst-case gaps (Hi→big, Lo→condition, Hi→Lo, big→condition, weekday letter margin)
 - ink alignment: `ink()` / `right_pen()` mirror Adafruit `getTextBounds`, so right-aligned text matches the device
 
@@ -15,7 +15,7 @@
 ```bash
 cd /Users/willbraden/Documents/Development/pebl-esp32
 ~/.platformio/penv/bin/python tools/weather_design.py
-open tools/preview.png tools/preview_words.png
+open tools/preview.png tools/preview_night.png tools/preview_words.png
 ```
 
 Edit the CONFIG block (fonts, `H_*` sizes, baselines, `PREVIEW`, `WORST`, `WORDS`), rerun, look.

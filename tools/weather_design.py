@@ -78,6 +78,7 @@ FIRST, LAST = 0x20, 0x7E        # printable ASCII
 STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond", day="WeatherDay")
 HEADER  = "src/weather/weather_fonts.h"
 PREVIEW_PNG = "tools/preview.png"
+PREVIEW_NIGHT_PNG = "tools/preview_night.png"
 
 
 def _pt_for_height(face, px):
@@ -286,6 +287,12 @@ def paste_art(img, art, fill=0):
                 px[ox + x, oy + y] = fill
 
 
+def night(img):
+    """Night theme: the firmware swaps ink and paper (setTheme()), so a night
+    screen is the day screen with every pixel inverted."""
+    return img.point(lambda x: 236 if x < 128 else 0)
+
+
 def main():
     big  = convert(FONT_BIG,  STRUCTS['big'],  H_BIG)
     hl   = convert(FONT_HL,   STRUCTS['hl'],   H_HL)
@@ -308,13 +315,16 @@ def main():
     blit(d, hl,   PREVIEW['lo'], LEFT_X, LO_BASE)
     blit(d, big,  PREVIEW['cur'],  right_pen(big,  PREVIEW['cur']),  CUR_BASE)
     blit(d, cond, PREVIEW['cond'], right_pen(cond, PREVIEW['cond']), COND_BASE)
-    img.point(lambda x: 0 if x < 128 else 236).resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)
-    print(f"wrote {PREVIEW_PNG}  (open it to see the layout)")
+    img = img.point(lambda x: 0 if x < 128 else 236)
+    img.resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)
+    night(img).resize((1000, 488), Image.NEAREST).save(PREVIEW_NIGHT_PNG)
+    print(f"wrote {PREVIEW_PNG} and {PREVIEW_NIGHT_PNG}  (open them to see the layout)")
 
-    # Word mode: every word on its own screen, stacked into one sheet.
+    # Word mode: every word on its own screen, stacked into one sheet,
+    # day on the left and night on the right.
     arts = build_words()
     names = WORDS + ["SHADES"]
-    sheet = Image.new("L", (500, len(names) * 254), 255)
+    sheet = Image.new("L", (1010, len(names) * 254), 255)
     for i, n in enumerate(names):
         scr = Image.new("L", (250, 122), 236); sd = ImageDraw.Draw(scr)
         sd.rectangle((0, 0, BAR_W - 1, 121), fill=0)
@@ -322,6 +332,7 @@ def main():
             blit(sd, day, c, x, y, fill=236)
         paste_art(scr, arts[n])
         sheet.paste(scr.resize((500, 244), Image.NEAREST), (0, i * 254))
+        sheet.paste(night(scr).resize((500, 244), Image.NEAREST), (510, i * 254))
     sheet.save(WORDS_PNG)
     print(f"wrote {WORDS_PNG}")
 

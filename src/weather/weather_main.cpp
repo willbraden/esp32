@@ -66,12 +66,27 @@ static const gpio_num_t PIN_USER_SW = GPIO_NUM_16;
 #define OTA_CHECK_EVERY_N_WAKES 4 // check for updates every 4th fetch (~2 h)
 #endif
 #define LONG_PRESS_MS     1500    // USER SW held this long = refresh + update check
+#ifndef NIGHT_INVERT
+#define NIGHT_INVERT      1       // 1 = white-on-black screens between sunset and sunrise
+#endif
 
 
 enum Mode : uint8_t { MODE_NUMBERS = 0, MODE_WORD = 1, MODE_COUNT };
 
 GxEPD2_BW<GxEPD2_213_B74, GxEPD2_213_B74::HEIGHT>
     display(GxEPD2_213_B74(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
+
+// ----- theme: all drawing uses these, so night mode is a plain swap -----
+// Night is the inverse of day pixel for pixel (tools/weather_design.py renders
+// the night previews by inverting the day ones). Status screens stay in the day
+// theme: they carry no reading to say whether it is dark.
+static uint16_t INK   = GxEPD_BLACK;
+static uint16_t PAPER = GxEPD_WHITE;
+static void setTheme(bool night) {
+    bool dark = NIGHT_INVERT && night;
+    INK   = dark ? GxEPD_WHITE : GxEPD_BLACK;
+    PAPER = dark ? GxEPD_BLACK : GxEPD_WHITE;
+}
 
 // ----- refresh meter: how long the panel held BUSY on each draw -----
 // A full refresh on this panel holds BUSY for ~2.3 s while it drives the
@@ -103,6 +118,7 @@ struct Weather {
     String day = "";       // "MON" — location-local weekday of the reading
     int    precipPct6h = 0;   // highest precipitation probability over the next 6 hours
     bool   snow6h = false;    // any snowfall / snow weather code in those 6 hours
+    bool   night = false;     // Open-Meteo is_day == 0: the sun is down at the reading
 };
 
 // Last successful reading, kept in RTC memory across deep sleep so a button
@@ -113,6 +129,7 @@ struct CachedWeather {
     float   temp, hi, lo;
     int     code, precipPct6h;
     bool    snow6h;
+    bool    night;
     char    day[4];
 };
 
@@ -261,7 +278,7 @@ static bool getWeather(double lat, double lon, Weather& w) {
     char url[320];
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-        "&current=temperature_2m,weather_code"
+        "&current=temperature_2m,weather_code,is_day"
         "&daily=temperature_2m_max,temperature_2m_min"
         "&hourly=precipitation_probability,snowfall,weather_code&forecast_hours=6"
         "&temperature_unit=%s&timezone=auto&forecast_days=1",
@@ -274,6 +291,7 @@ static bool getWeather(double lat, double lon, Weather& w) {
 
     w.temp = doc["current"]["temperature_2m"] | 0.0f;
     w.code = doc["current"]["weather_code"]    | 0;
+    w.night = (doc["current"]["is_day"] | 1) == 0;   // missing -> day theme
     w.hi   = doc["daily"]["temperature_2m_max"][0] | 0.0f;
     w.lo   = doc["daily"]["temperature_2m_min"][0] | 0.0f;
 
@@ -301,21 +319,21 @@ static bool getWeather(double lat, double lon, Weather& w) {
 
 // ----- icon drawing (filled black silhouettes) -----
 static void drawSun(int cx, int cy, int r) {
-    display.fillCircle(cx, cy, r, GxEPD_BLACK);
+    display.fillCircle(cx, cy, r, INK);
     for (int i = 0; i < 8; i++) {
         float a = i * PI / 4.0;
         int x1 = cx + cos(a) * (r + 4), y1 = cy + sin(a) * (r + 4);
         int x2 = cx + cos(a) * (r + 10), y2 = cy + sin(a) * (r + 10);
-        display.drawLine(x1, y1, x2, y2, GxEPD_BLACK);
+        display.drawLine(x1, y1, x2, y2, INK);
     }
 }
 
 static void drawCloud(int cx, int cy, int w) {
     int r1 = w * 0.20, r2 = w * 0.28, r3 = w * 0.22;
-    display.fillCircle(cx - w * 0.26, cy,             r1, GxEPD_BLACK);
-    display.fillCircle(cx - w * 0.02, cy - w * 0.12,  r2, GxEPD_BLACK);
-    display.fillCircle(cx + w * 0.28, cy - w * 0.02,  r3, GxEPD_BLACK);
-    display.fillRect(cx - w * 0.46, cy, w * 0.94, w * 0.22, GxEPD_BLACK);
+    display.fillCircle(cx - w * 0.26, cy,             r1, INK);
+    display.fillCircle(cx - w * 0.02, cy - w * 0.12,  r2, INK);
+    display.fillCircle(cx + w * 0.28, cy - w * 0.02,  r3, INK);
+    display.fillRect(cx - w * 0.46, cy, w * 0.94, w * 0.22, INK);
 }
 
 static void drawIcon(int code, int bx, int by, int s) {
@@ -334,25 +352,25 @@ static void drawIcon(int code, int bx, int by, int s) {
         case CAT_FOG:
             drawCloud(bx, by - s * 0.12, s * 0.8);
             for (int i = 0; i < 3; i++)
-                display.drawFastHLine(bx - s * 0.36, by + s * 0.18 + i * 6, s * 0.72, GxEPD_BLACK);
+                display.drawFastHLine(bx - s * 0.36, by + s * 0.18 + i * 6, s * 0.72, INK);
             break;
         case CAT_RAIN:
             drawCloud(bx, by - s * 0.14, s * 0.8);
             for (int i = -1; i <= 1; i++)
                 display.drawLine(bx + i * 10, by + s * 0.16,
-                                 bx + i * 10 - 4, by + s * 0.34, GxEPD_BLACK);
+                                 bx + i * 10 - 4, by + s * 0.34, INK);
             break;
         case CAT_SNOW:
             drawCloud(bx, by - s * 0.14, s * 0.8);
             for (int i = -1; i <= 1; i++)
-                display.fillCircle(bx + i * 11, by + s * 0.26, 2, GxEPD_BLACK);
+                display.fillCircle(bx + i * 11, by + s * 0.26, 2, INK);
             break;
         case CAT_STORM:
             drawCloud(bx, by - s * 0.14, s * 0.8);
             display.fillTriangle(bx, by + s * 0.10, bx - 8, by + s * 0.32,
-                                 bx + 2, by + s * 0.30, GxEPD_BLACK);
+                                 bx + 2, by + s * 0.30, INK);
             display.fillTriangle(bx + 2, by + s * 0.30, bx + 9, by + s * 0.30,
-                                 bx + 1, by + s * 0.52, GxEPD_BLACK);
+                                 bx + 1, by + s * 0.52, INK);
             break;
     }
 }
@@ -360,8 +378,8 @@ static void drawIcon(int code, int bx, int by, int s) {
 // ----- rendering -----
 static void drawDegreeF(int x, int topY, bool showF) {
     // small degree ring + optional F, drawn just right of the big number
-    display.drawCircle(x + 6, topY + 7, 4, GxEPD_BLACK);
-    display.drawCircle(x + 6, topY + 7, 3, GxEPD_BLACK);
+    display.drawCircle(x + 6, topY + 7, 4, INK);
+    display.drawCircle(x + 6, topY + 7, 3, INK);
     if (showF) {
         display.setFont(&FreeSansBold9pt7b);
         display.setCursor(x + 12, topY + 24);
@@ -417,9 +435,9 @@ static const WordArt& wordArtFor(const Weather& w) {
 // in tools/weather_design.py.
 static void drawDayBar(const String& day, int barW, int capH, int gap) {
     int H = display.height();
-    display.fillRect(0, 0, barW, H, GxEPD_BLACK);
+    display.fillRect(0, 0, barW, H, INK);
     display.setFont(&WeatherDay);
-    display.setTextColor(GxEPD_WHITE);
+    display.setTextColor(PAPER);
     int n = day.length();
     int top = (H - (n * capH + (n - 1) * gap)) / 2;
     for (int i = 0; i < n; i++) {
@@ -429,7 +447,7 @@ static void drawDayBar(const String& day, int barW, int capH, int gap) {
         display.setCursor((barW - (int)bw) / 2 - bx, top + i * (capH + gap) + capH);
         display.print(c);
     }
-    display.setTextColor(GxEPD_BLACK);
+    display.setTextColor(INK);
 }
 
 // Weekday bar geometry, shared by both screens.
@@ -446,11 +464,11 @@ static void renderWord(const Weather& w) {
     drawStart();
     display.firstPage();
     do {
-        display.fillScreen(GxEPD_WHITE);
+        display.fillScreen(PAPER);
         drawDayBar(w.day, BAR_W, DAY_CAP, DAY_GAP);
-        display.drawBitmap(x, y, a.bits, a.w, a.h, GxEPD_BLACK);
+        display.drawBitmap(x, y, a.bits, a.w, a.h, INK);
     } while (display.nextPage());
-    drawDone("word");
+    drawDone(w.night && NIGHT_INVERT ? "word-night" : "word");
 }
 
 static void renderWeather(const Weather& w) {
@@ -465,12 +483,12 @@ static void renderWeather(const Weather& w) {
     const int CUR_BASE  = 76;           // big current temp baseline (right; top level with Hi)
     const int COND_BASE = 103;          // condition word baseline (right)
 
-    display.setTextColor(GxEPD_BLACK);
+    display.setTextColor(INK);
     display.setFullWindow();
     drawStart();
     display.firstPage();
     do {
-        display.fillScreen(GxEPD_WHITE);
+        display.fillScreen(PAPER);
         int16_t bx, by; uint16_t bw, bh;
 
         // ---- weekday of this reading, so a stale screen (dead battery) is obvious ----
@@ -497,18 +515,19 @@ static void renderWeather(const Weather& w) {
         display.setCursor(RIGHT_X - bw - bx, COND_BASE);
         display.print(lab);
     } while (display.nextPage());
-    drawDone("numbers");
+    drawDone(w.night && NIGHT_INVERT ? "numbers-night" : "numbers");
 }
 
 static void renderMessage(const char* line1, const char* line2) {
     int W = display.width(), H = display.height();
-    display.setTextColor(GxEPD_BLACK);
+    setTheme(false);
+    display.setTextColor(INK);
     display.setFullWindow();
     drawStart();
     display.firstPage();
     do {
-        display.fillScreen(GxEPD_WHITE);
-        display.drawRect(0, 0, W, H, GxEPD_BLACK);
+        display.fillScreen(PAPER);
+        display.drawRect(0, 0, W, H, INK);
         display.setFont(&FreeSansBold9pt7b);
         display.setCursor(12, 56);
         display.print(line1);
@@ -558,6 +577,7 @@ static void saveMode(Mode m) {
 }
 
 static void render(const Weather& w, Mode m) {
+    setTheme(w.night);
     if (m == MODE_WORD) renderWord(w);
     else                renderWeather(w);
 }
@@ -574,6 +594,7 @@ static void cacheStore(const Weather& w) {
     rtc.cache.fetchedAt = nowSecs();
     rtc.cache.temp = w.temp; rtc.cache.hi = w.hi; rtc.cache.lo = w.lo;
     rtc.cache.code = w.code; rtc.cache.precipPct6h = w.precipPct6h; rtc.cache.snow6h = w.snow6h;
+    rtc.cache.night = w.night;
     strlcpy(rtc.cache.day, w.day.c_str(), sizeof(rtc.cache.day));
 }
 
@@ -582,6 +603,7 @@ static Weather cacheLoad() {
     w.ok = true;
     w.temp = rtc.cache.temp; w.hi = rtc.cache.hi; w.lo = rtc.cache.lo;
     w.code = rtc.cache.code; w.precipPct6h = rtc.cache.precipPct6h; w.snow6h = rtc.cache.snow6h;
+    w.night = rtc.cache.night;
     w.day = rtc.cache.day;
     return w;
 }
@@ -807,9 +829,9 @@ void setup() {
         sleepAndRepeat();
     }
     w.city = city;
-    Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  precip6h %d%%%s  @ %s %s\n",
+    Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  precip6h %d%%%s  @ %s %s %s\n",
                   w.temp, w.hi, w.lo, w.code, w.precipPct6h, w.snow6h ? " (snow)" : "",
-                  w.day.c_str(), w.updated.c_str());
+                  w.day.c_str(), w.updated.c_str(), w.night ? "night" : "day");
 
     bootlog::stage("weather");
     cacheStore(w);
