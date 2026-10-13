@@ -29,4 +29,4 @@ To add a real reading: 2 × 100 kΩ in series from battery + to GND, midpoint to
 
 - Don't "estimate" battery from wake counts. It can't tell a full charge from a partial one. The user rejected it as a workaround.
 - A low-voltage-reset trigger (draw CHARGE after a brownout reset) doesn't work here: the drain test showed no reset before cutoff.
-- `src/main.cpp` (legacy client) has battery code, but it reads the wrong pins for the S3 and there is no divider to read anyway.
+- `src/main.cpp` (legacy Slack client, kept only for its WiFi code) has battery code, but it reads the wrong pins for the S3 and there is no divider to read anyway.

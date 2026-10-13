@@ -22,4 +22,5 @@ First setup: power on with no saved network, join the `pebl-weather` WiFi from a
 
 - The portal blocks for up to 180 s. It must never run on unattended wakes; an earlier version froze for minutes that way. Keep the `timerWake || buttonWake` guard.
 - Dozens of `STA.cpp ... Reason: 1 - UNSPECIFIED` warnings before `WiFi OK` are normal reconnect chatter in this core. Hide them with `--quiet`.
-- Credentials live in NVS, shared with the legacy firmware's provisioning. Erasing flash (`esptool erase_flash`) removes them.
+- Credentials live in the WiFi driver's NVS store, so a network saved by the original factory pebl firmware still works. Erasing flash (`esptool erase_flash`) removes them.
+- Older multi-network and QR-code provisioning code is kept, unbuilt, in `src/wifi/` and `src/main.cpp`. See `legacy-wifi-tooling.md` before porting any of it.

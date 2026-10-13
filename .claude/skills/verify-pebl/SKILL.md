@@ -35,7 +35,7 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 
 ## Command surface
 
-- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). The `lilygo_*` envs are the legacy pebl client and are not verified on this board.
+- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). Each env compiles only its own `src/` folder (`build_src_filter`); give any new env one too.
 - **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote. Full procedure in [Ship an update](#ship-an-update).
 - **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.

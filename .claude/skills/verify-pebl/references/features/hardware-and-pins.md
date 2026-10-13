@@ -14,7 +14,7 @@ The board, every GPIO we know the job of, and how each fact was established. The
 | Display driver | `GxEPD2_BW<GxEPD2_213_B74>`, drawn at **250 × 122** with `setRotation(3)` | border test fills the panel exactly |
 | Display power boost | Inductor marked "470", SOT-23 MOSFET, three SOD diodes marked "SE", "2R2" sense resistor, all beside the FPC. This is the panel's high-voltage supply, not the 3.3 V rail | photo, matches the standard e-paper reference circuit |
 
-`EINK_PIN_DISCOVERY.md` lists the panel as 212 × 104 and the boot button as GPIO39. Both are wrong for this board. The firmware renders 250 × 122, and BOOT is GPIO0 (button probe, 2026-10-12).
+`EINK_PIN_DISCOVERY.md` is the reverse-engineering story behind the display pins. The old Slack client code (`src/main.cpp`) assumes a 212 × 104 panel and BOOT on GPIO39. Both are wrong for this board. The firmware renders 250 × 122, and BOOT is GPIO0 (button probe, 2026-10-12).
 
 ### Display pins (confirmed by rendering)
 
@@ -73,5 +73,5 @@ Board face up, panel on the right: USB-C at the top edge, the three buttons and 
 ## Gotchas
 
 - Any probe that runs `Wire.end()` leaves pins with internal pull-ups on (`gpio_reset_pin`). Floating ADC pins then read full scale. Read ADC first, or disable pulls explicitly.
-- Classic-ESP32 ADC channel constants (`ADC1_CHANNEL_7` = "GPIO35") map to different pins on the S3. `src/main.cpp`'s battery code makes this mistake.
+- Classic-ESP32 ADC channel constants (`ADC1_CHANNEL_7` = "GPIO35") map to different pins on the S3. The legacy `src/main.cpp` battery code makes this mistake.
 - Pressing USER SW while the panel refreshes shorts the driven-high CS to ground. The firmware sets GPIO16 to `GPIO_DRIVE_CAP_0` to limit that current; keep it if you touch `initDisplay()`.

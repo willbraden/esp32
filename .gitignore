@@ -3,9 +3,10 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+# local config for the kept legacy WiFi tooling; holds secrets
 data/config.json
-.DS_Store
 data/get-platformio.py
+.DS_Store
 
 # editor swap files
 *.swp

@@ -1,6 +1,6 @@
 # Diagnostic firmwares
 
-Standalone probe builds, each with its own env and source folder. Use them to answer hardware questions instead of guessing. Flashing one replaces the weather firmware until you flash `pebl_weather` back.
+Standalone probe builds, each with its own env and source folder (`build_src_filter = -<*> +<folder/>`; the shared `[env]` in `platformio.ini` supplies the board, flash size and partitions). Use them to answer hardware questions instead of guessing. Flashing one replaces the weather firmware until you flash `pebl_weather` back.
 
 ## Sub-features
 

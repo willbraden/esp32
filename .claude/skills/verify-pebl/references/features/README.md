@@ -48,12 +48,12 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 ## Tooling
 
 - [design-tool](design-tool.md): `tools/weather_design.py`: fonts, word art, previews, gap check.
-- [diagnostic-firmwares](diagnostic-firmwares.md): `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`: what each one proves.
+- [diagnostic-firmwares](diagnostic-firmwares.md): `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail`: what each one proves.
 
 ## Open problems and legacy
 
 - [known-issues](known-issues.md): Open bugs with evidence (the lwIP `pbuf_free` crash after boot, the post-reboot wedge) and resolved ones that could come back.
-- [legacy-pebl-client](legacy-pebl-client.md): The original Slack/Discord client still in `src/`, and why it is untested here.
+- [legacy-wifi-tooling](legacy-wifi-tooling.md): The original client's multi-network WiFi and QR provisioning code, kept unbuilt as reference, and what a port must change.
 
 ## Multi-surface journeys
 

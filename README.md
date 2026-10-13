@@ -1,153 +1,80 @@
-# ESP32 Arduino Client
+# pebl weather
 
-Arduino/C++ client for LilyGo T5 e-paper displays. Shows real-time Slack and Discord reactions with power management and battery monitoring. Part of [Pebl](https://pebl.ink).
+Firmware that turns a pebl.ink ESP32-S3 e-ink board into a battery-powered weather
+display. It wakes every 30 minutes, shows today's weather on the 2.13" panel, and goes
+back to deep sleep. It needs no account, no API key and no computer once it's flashed.
 
-## Supported Devices
+- **Location:** found automatically from the network's IP address (ip-api.com)
+- **Weather:** current temperature, today's high/low and conditions from Open-Meteo
+- **Two screens:** numbers (big Hi/Lo, current temp, conditions, an inverted weekday bar
+  that shows how old the reading is) or one word (SNOW / RAIN / FREEZE / COLD / CHILLY /
+  sunglasses / HOT / HELL)
+- **USER SW button:** press to switch screens (saved across power-off). Hold ~2 s to
+  fetch fresh weather and check for an update.
+- **Updates itself** over WiFi from signed GitHub releases, with automatic rollback if a
+  new version fails to boot
 
-### Tested & Working (2.13", 212x104)
+## Hardware
 
-| Environment | Display Chip | Mode |
-|-------------|-------------|------|
-| `lilygo_t5_gdew_4g` | GDEW0213T5D | 4-level grayscale (**recommended**) |
-| `lilygo_t5_gdew_bw` | GDEW0213T5D | BW only |
-| `lilygo_t5_depg_bw` | DEPG0213BN | BW (most common T5 V2.3.1) |
+ESP32-S3-WROOM-1 (4 MB flash, native USB), SSD1680 2.13" black/white panel driven at
+250 × 122, LiPo battery. There is no battery-voltage sensing on this board.
 
-### Untested (Should Work)
+| Signal | GPIO |
+|---|---|
+| Display PWR / RST / CS / DC / BUSY | 13 / 8 / 16 / 12 / 14 |
+| Display SCLK / MOSI | 10 / 9 |
+| USER SW (shared with display CS) | 16 |
+| BOOT | 0 |
 
-| Environment | Display Chip | Mode |
-|-------------|-------------|------|
-| `lilygo_t5_gdem_4g` | GDEM0213B74 | 4-level grayscale |
-| `lilygo_t5_gdey_4g` | GDEY0213B74 | 4-level grayscale |
-| `lilygo_t5s_27` | GDEY027T91 | BW (2.7", 264x176) |
+How the pins were found: [EINK_PIN_DISCOVERY.md](EINK_PIN_DISCOVERY.md).
 
-**Important**: Match your environment to your actual display chip label. Do NOT use `gdem_4g` or `gdey_4g` for GDEW0213T5D displays.
+## Build and flash
 
-## Features
-
-- Real-time WebSocket (WSS) connection with auto-reconnect and exponential backoff
-- AES-256-CBC / ECDH+AES encryption with lock/unlock status indicator
-- Graphical emoji rendering (PNG download + decode) with text fallback
-- Smart deep sleep on battery, always-awake on USB
-- 1-minute wake cycles during work hours, 30-minute during quiet hours/weekends
-- Battery indicator (3-dot display with charging icon)
-- Automatic timezone detection via server GeoIP
-- Graceful shutdown with proper resource cleanup
-- Configuration via SPIFFS JSON file
-
-## Quick Start
-
-### Flash a Device
+Needs PlatformIO Core 6.1.19 or later.
 
 ```bash
-./flash.sh           # Interactive: prompts for name, variant, rotation
-./flash.sh --dry-run  # Preview config without flashing
+pio run -e pebl_weather                                   # build
+pio run -e pebl_weather -t upload --upload-port /dev/cu.usbmodem101
+python tools/serial_log.py --quiet --until Sleeping       # watch one wake cycle
 ```
 
-The script auto-detects the USB port, writes config, uploads filesystem, and flashes firmware.
+The USB port disappears while the board sleeps. To flash it then, hold BOOT, tap RESET,
+release BOOT, and upload. After flashing in download mode, tap RESET once (or run
+`esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`).
 
-| Default | Value |
-|---------|-------|
-| Name | `pebl` |
-| Variant | `lilygo_t5_gdew_4g` |
-| Rotation | `1` (landscape) |
+First boot with no saved network opens a `pebl-weather` WiFi hotspot. Join it from a
+phone and pick your network.
 
-### Manual Flash
+## Releasing an update
+
+Releases come only from CI. Push an annotated tag and the
+[release workflow](.github/workflows/weather-release.yml) builds, tests, signs and
+publishes it. Devices pick it up within about 2 hours.
 
 ```bash
-# 1. Edit data/config.json
-# 2. Upload filesystem + firmware
-pio run -e lilygo_t5_gdew_4g --target uploadfs --upload-port /dev/cu.usbserial-XXXX
-pio run -e lilygo_t5_gdew_4g --target upload --upload-port /dev/cu.usbserial-XXXX
-pio device monitor -b 115200
+git tag -a weather-v1.0.1 -m "pebl weather 1.0.1: <summary>"
+git push willbraden weather-v1.0.1        # -rc tags go to the staging channel only
 ```
 
-## Configuration
+The signing key is never in the repo. CI reads it from the `PEBL_OTA_SIGNING_KEY`
+secret. Full procedure and safeguards:
+[`.claude/skills/verify-pebl/SKILL.md`](.claude/skills/verify-pebl/SKILL.md#ship-an-update).
 
-### Power Management
+## Layout
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `sleep_enabled` | `true` | Deep sleep on battery |
-| `sleep_duration_min` | `1` | Minutes between wake cycles |
-| `battery_pin` | `36` | GPIO for battery voltage |
-| `usb_threshold_v` | `4.2` | Voltage threshold for USB detection |
+| Path | What |
+|---|---|
+| `src/weather/` | The firmware: `weather_main.cpp`, OTA updater (`ota.cpp`, `semver.h`), generated fonts and word art |
+| `tools/weather_design.py` | Layout tool: generates the fonts and word art, and renders pixel-exact previews |
+| `tools/ota_sign.py` | Signs and verifies release manifests |
+| `tools/serial_log.py` | Serial logger that survives deep sleep |
+| `tools/test_semver.cpp` | Unit tests for version comparison |
+| `src/battprobe/`, `src/btnprobe/`, `src/netstress/`, `src/otafail/` | Diagnostic firmwares, one env each |
+| `src/wifi/`, `src/config/`, `src/main.cpp`, `data/` | WiFi tooling from the original pebl Slack client, kept as reference. Not built |
+| `.claude/skills/verify-pebl/` | Full feature and hardware reference, plus how to prove changes on the device |
 
-**Behavior**: USB = always awake. Battery = 1-min wake cycles (active hours), 30-min cycles (quiet hours). ~6 days on 2000mAh battery.
+## Known issues
 
-### Quiet Hours
-
-```json
-"quiet_hours": {
-  "start_hour": 23,
-  "end_hour": 7,
-  "sleep_multiplier": 6
-}
-```
-
-Weekdays: quiet hours from 11 PM - 7 AM. Weekends: quiet all day.
-
-### Display Policy
-
-```json
-"display_policy": {
-  "skip_refresh_on_no_message": true,
-  "show_sleep_text": false,
-  "update_battery_on_wake": false
-}
-```
-
-With `skip_refresh_on_no_message` enabled, the display only refreshes when new reactions arrive (~20 refreshes/day instead of ~1,440).
-
-### Display Rotation
-
-`0` = portrait, `1` = landscape (default), `2` = portrait inverted, `3` = landscape inverted
-
-## Boot Button
-
-The BOOT button (GPIO 39) supports three actions based on hold duration:
-
-| Hold | Action | Details |
-|------|--------|---------|
-| Short press | Wake | Wakes device from deep sleep |
-| 3–14 seconds | Add platform | Shows QR code to link an additional platform (e.g., add Discord to a Slack-linked device) |
-| 15+ seconds | WiFi setup | Launches captive portal for WiFi provisioning |
-
-At the 3-second mark, the display shows feedback so you know when to release. The "Add platform" QR code points to the `/connect` page with device credentials pre-filled. After 3 minutes the device restarts automatically to connect with all linked platforms. Press the button to restart immediately.
-
-The "Add platform" option only appears if the device is already paired (has an auth token). On an unpaired device, only WiFi provisioning is available.
-
-## Project Structure
-
-```
-esp32_arduino_client/
-├── src/
-│   ├── main.cpp                 # Main application
-│   ├── config/ConfigManager.*   # Configuration management
-│   ├── security/SecurityManager.*  # Encryption
-│   └── resilience/ResilienceManager.*  # Connection health
-├── data/config.json             # Device configuration
-├── docs/                        # Detailed guides
-├── platformio.ini               # Build configuration
-└── flash.sh                     # Interactive flash script
-```
-
-## Troubleshooting
-
-See [docs/INSTALLATION_GUIDE.md](docs/INSTALLATION_GUIDE.md) for detailed troubleshooting.
-
-| Problem | Quick Fix |
-|---------|-----------|
-| Display not working | Verify display type matches hardware. See [Display Support](docs/DISPLAY_SUPPORT.md) |
-| WiFi won't connect | Check SSID/password in config.json. Must be 2.4GHz |
-| WebSocket fails | Verify `wss://` URL and device registration |
-| Upload errors | Hold BOOT button during upload. Use a data-capable USB cable |
-
-## Documentation
-
-- [Installation Guide](docs/INSTALLATION_GUIDE.md) — Setup, auth, and troubleshooting
-- [Display Support](docs/DISPLAY_SUPPORT.md) — Driver details and identification
-- [Security Notes](docs/SECURITY_NOTES.md) — Encryption and key management
-
-## License
-
-See main project LICENSE file.
+An lwIP `pbuf_free` crash hits about 1 in 3 boots right after the location lookup (it reboots
+and tries again, so the screen still updates), and a rare wedge after a software reboot
+leaves the board frozen until it's power-cycled. Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).
