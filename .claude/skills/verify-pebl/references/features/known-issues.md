@@ -33,21 +33,22 @@ This is what earlier notes called "the board wedges after a software reboot". **
 
 Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
-### OPEN: blank panel after the first draw of an OTA update
+### WATCHING: blank panel after the first draw of an OTA update
 
 `weather-v1.1.1`, 2026-10-13: the long press installed it (boot log #104 `ota=installing-1.1.1`), and its first boot (#105) fetched, drew (`path=...>drawn>ota>sleep`), checked (`ota=up-to-date`) and confirmed itself (otadata state `0x2` VALID). But the panel showed **pure white** instead of the weather. A fresh boot of the same image (watchdog reset, on USB) drew normally. The board was on battery during the update. Crash restarts earlier the same day were followed by normal draws, so a plain software restart isn't enough to cause it. What was different: a full refresh ("Updating firmware...") about 30 s before the restart, with the panel left powered, and battery power.
 
 Hypotheses: (1) the SSD1680 is left in a state the next init doesn't recover from, because the panel isn't powered off before the install restart; (2) the boost converter can't reach drive voltage on battery under Wi-Fi load right after the download, washing the image out.
 
-Not reproduced (2026-10-13, staging rig, `pebl_weather_staging` 1.3.0 -> 1.3.3, with the per-draw panel timing below). Three updates, each followed by a trial boot that drew the weather on the panel:
+Not reproduced (2026-10-13) in four updates with the per-draw panel timing: three on the staging rig (`pebl_weather_staging` 1.3.0 -> 1.3.3), then the real `weather-v1.1.2` release installed the same way as the failing one. Every trial boot drew the weather on the panel:
 
 | Update | Power | Download | Trial boot |
 |---|---|---|---|
 | 1.3.0 -> 1.3.1 | USB (Mac) | ~15 s, local HTTP | #114 `draw=numbers:2284ms usb=host`, weather on screen |
 | 1.3.1 -> 1.3.2 | battery | ~15 s, local HTTP | #118 `draw=numbers:2284ms usb=none`, weather on screen |
 | 1.3.2 -> 1.3.3 | battery | ~70 s, throttled to 24 KB/s like the GitHub download | #121 `draw=numbers:2284ms usb=none`, weather on screen |
+| `weather-v1.1.2` from GitHub, long press | battery | real TLS download | #126 `draw=numbers:2284ms usb=none`, weather on screen, confirmed. An exact replay of the failing case |
 
-Every refresh in those runs, including each "Updating firmware..." screen, held BUSY for 2284 ms. Hypothesis (1) as stated is also weakened by the code: GxEPD2's `init()` pulses the panel's RST line on every boot. Still different from the real event: a TLS download from GitHub (CPU load as well as Wi-Fi), the long-press boot that started it, and the battery's charge at the time (this board has no battery sense, so it can't be logged).
+Every refresh in those runs, including each "Updating firmware..." screen, held BUSY for 2284 ms. Hypothesis (1) as stated is also weakened by the code: GxEPD2's `init()` pulses the panel's RST line on every boot. The only thing the replay couldn't match is the battery's charge at the time (it had been on battery through a day of testing; this board has no battery sense, so it can't be logged). Treated as a one-off, most likely a low battery, until the boot log shows it again.
 
 Since then every draw is in the boot log (`draw=<screen>:<ms> usb=host|none`, see `serial-diagnostics.md`). If it happens again, read the boot log before anything else: ~2300 ms on the blank boot means the panel ran a full refresh and the image or the drive voltage was wrong; near 0 means the panel never ran it; `TIMEOUT` means it hung.
 
