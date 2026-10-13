@@ -33,15 +33,24 @@ This is what earlier notes called "the board wedges after a software reboot". **
 
 Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
-### OPEN: OTA updates fail their trial boot
+### FIXED: OTA updates failed their trial boot (2026-10-13)
 
-`weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (2026-10-13; NVS `pebl-ota/bad_cnt=3`, read with esptool). It reached the device by USB instead and runs fine. One failed trial was photographed: Wi-Fi didn't connect after the install restart, the firmware treated the restart as a power-on and opened the 180 s setup portal, then slept unconfirmed, which counts as a rollback. The other two left no evidence (the boot log didn't exist yet), but the `pbuf_free` crash above hit right after `Loc:` on most boots, and the OTA code's own manifest fetch and download had the same use-after-free. Both are fixed. Three design flaws remain, and they still turn any trial-boot failure (slow Wi-Fi after a restart, a router blip) into a failed update:
+`weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (NVS `pebl-ota/bad_cnt=3`); it reached the device by USB instead. Causes, all fixed:
 
-- The trial boot treats `sw-restart` like a power-on: it opens the setup portal instead of behaving as an unattended wake.
-- A rollback boot is a cold boot, and cold boots check for updates at once, so all 3 attempts burn within minutes.
-- Any failure on the trial boot (network included) rolls the image back, not just failures the image caused.
+- **The `pbuf_free` crash** (above) hit right after `Loc:` on most boots, and the OTA code's own manifest fetch and download had the same use-after-free. Any crash on a trial boot rolls back.
+- **The install restart counted as a power-on**, so a Wi-Fi miss opened the 180 s setup portal (photographed). Now the portal opens only when a person started the boot (power-on, RESET, USB reset) and never on a trial boot.
+- **No retries.** A trial boot now tries Wi-Fi 3× and each fetch 2×.
+- **Deep sleep never rolls back** (`CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP`): an unconfirmed image kept running wake after wake and only rolled back when something reset it, the crash in practice. Now it counts its failed boots and rolls itself back after 3 (`esp_ota_mark_app_invalid_rollback_and_reboot()`).
+- **Back-to-back attempts.** The boot after a rollback is a fresh boot, and fresh boots check at once. Now that boot waits for the normal schedule, so the 3 attempts are spread out.
 
-Until these are fixed (step 3 of the 2026-10-13 OTA plan), treat OTA as unreliable and prove each release on the device.
+Proof on the staging rig (`pebl_weather_fault`, 1-minute wakes, check every 3rd wake, 2026-10-13):
+
+| Image | Forced Wi-Fi failures on trial boots | Result |
+|---|---|---|
+| 1.2.1 | 1 | first attempt failed, retry connected, confirmed: the trial boot reached the server 26 s after the download and `try_ver` was cleared |
+| 1.2.2 | all | each attempt: 3 trial boots with `fail=wifi trial`, no portal, then self-rollback (`next-boot=sw-restart`); the next boot logged `rolled-back-from=1.2.2(attempt-n/3)` and did not check; attempts at 13:41, 13:49, 13:57 (one scheduled check between each); then `ota=skipped-bad` |
+
+Not yet proven on a real release through GitHub: do that with the next `weather-v*` tag.
 
 ### RESOLVED: double full refresh on every wake
 

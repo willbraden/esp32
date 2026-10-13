@@ -27,6 +27,7 @@ static const char* KEY_TRY_VER   = "try_ver";    // version being installed
 static const char* KEY_TRY_PART  = "try_part";   // partition it was written to
 static const char* KEY_BAD_VER   = "bad_ver";    // version that rolled back
 static const char* KEY_BAD_CNT   = "bad_cnt";    // how many times it rolled back
+static const char* KEY_TRIAL_N   = "trial_n";    // failed unconfirmed boots of try_ver
 static const uint8_t MAX_TRIES   = 3;            // then stop downloading it
 static const char* SIGNED_DOMAIN = "pebl-weather-ota/1";
 static const size_t MANIFEST_MAX = 4096;
@@ -50,7 +51,9 @@ bool beginBoot() {
         String tryVer = p.getString(KEY_TRY_VER, "");
         String tryPart = p.isKey(KEY_TRY_PART) ? p.getString(KEY_TRY_PART, "") : "";
         if (tryPart == running->label) {
-            Serial.printf("OTA: first boot of v%s on %s (trial)\n", tryVer.c_str(), running->label);
+            uint8_t failed = p.isKey(KEY_TRIAL_N) ? p.getUChar(KEY_TRIAL_N, 0) : 0;
+            Serial.printf("OTA: v%s on %s is unconfirmed (trial boot %u/%d)\n",
+                          tryVer.c_str(), running->label, failed + 1, MAX_TRIAL_BOOTS);
         } else {
             // The bootloader went back to the old slot: the update rebooted before
             // confirming. Could be a broken release or an unrelated crash, so allow
@@ -61,6 +64,7 @@ bool beginBoot() {
             p.putUChar(KEY_BAD_CNT, n);
             p.remove(KEY_TRY_VER);
             p.remove(KEY_TRY_PART);
+            p.remove(KEY_TRIAL_N);
             Serial.printf("OTA: v%s never confirmed, rolled back to v%s on %s (attempt %u/%u)\n",
                           tryVer.c_str(), FW_VERSION, running->label, n, MAX_TRIES);
             snprintf(s_rolledBack, sizeof(s_rolledBack), "%s(attempt-%u/%u)", tryVer.c_str(), n, MAX_TRIES);
@@ -82,6 +86,7 @@ void confirmHealthy() {
     p.begin(NVS_NS, false);
     p.remove(KEY_TRY_VER);
     p.remove(KEY_TRY_PART);
+    p.remove(KEY_TRIAL_N);
     // An earlier attempt at this version may have rolled back; it has now
     // proven itself, so drop that history.
     if (p.isKey(KEY_BAD_VER) && p.getString(KEY_BAD_VER, "") == FW_VERSION) {
@@ -89,6 +94,24 @@ void confirmHealthy() {
         p.remove(KEY_BAD_CNT);
     }
     p.end();
+}
+
+int recordFailedTrial() {
+    if (!s_pending) return 0;
+    Preferences p;
+    p.begin(NVS_NS, false);
+    uint8_t n = (p.isKey(KEY_TRIAL_N) ? p.getUChar(KEY_TRIAL_N, 0) : 0) + 1;
+    p.putUChar(KEY_TRIAL_N, n);
+    p.end();
+    Serial.printf("OTA: v%s trial boot %u/%d failed\n", FW_VERSION, n, MAX_TRIAL_BOOTS);
+    return n;
+}
+
+void rollBack() {
+    Serial.printf("OTA: v%s never confirmed, rolling back now\n", FW_VERSION);
+    Serial.flush();
+    esp_err_t e = esp_ota_mark_app_invalid_rollback_and_reboot();   // restarts on success
+    Serial.printf("OTA: rollback failed (%s)\n", esp_err_to_name(e));
 }
 
 // ---------------------------------------------------------------- network
@@ -260,6 +283,7 @@ Result checkAndInstall(void (*onInstalling)(const char* version)) {
     p.begin(NVS_NS, false);
     p.putString(KEY_TRY_VER, version);
     p.putString(KEY_TRY_PART, target->label);
+    p.remove(KEY_TRIAL_N);                       // a fresh install starts its trial count at 0
     p.end();
     if (!Update.end(true)) {
         Serial.printf("OTA: Update.end: %s\n", Update.errorString());

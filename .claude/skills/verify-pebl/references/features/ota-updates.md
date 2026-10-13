@@ -4,12 +4,12 @@ The device updates itself from signed GitHub releases. Code: `src/weather/ota.{h
 
 ## Sub-features
 
-- pull-check: after a successful fetch + render, fetch the channel manifest every `OTA_CHECK_EVERY_N_WAKES` (4 → ~2 h), on every cold boot, and on a USER SW long press (≥ 1.5 s after wake)
+- pull-check: after a successful fetch + render, fetch the channel manifest every `OTA_CHECK_EVERY_N_WAKES` (4 → ~2 h), on every power-on or RESET, but not on the boot right after a rollback (the next try waits for the normal schedule), and on a USER SW long press (≥ 1.5 s after wake)
 - channels: `weather-ota-stable` (plain versions) and `weather-ota-staging` (also `-rc` prereleases), set at build time by `OTA_CHANNEL_URL`
 - version gate: install only if the manifest version is newer (`semver.h`, unit-tested by `tools/test_semver.cpp`); local builds are `X.Y.Z+dev...`, which equals its tag
 - download: HTTPS with certificate validation (embedded Mozilla bundle), following GitHub's redirect, streamed into the spare app slot, hashed as it arrives
 - signature: ECDSA P-256 over `pebl-weather-ota/1\n<version>\n<size>\n<sha256>\n`, checked against `ota_pubkey.h` **before** the boot partition changes
-- trial boot + rollback: the new image boots `PENDING_VERIFY` and confirms only after a successful fetch + render (`ota::confirmHealthy()`); any reboot before that rolls back
+- trial boot + rollback: the new image boots `PENDING_VERIFY` and confirms only after a successful fetch + render (`ota::confirmHealthy()`). A crash or reset before that makes the bootloader roll back. **A deep-sleep wake does not** (`CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP` re-enters the last image without reading the OTA state), so the unconfirmed image counts its own failed boots before each sleep (`trial_n`) and calls `esp_ota_mark_app_invalid_rollback_and_reboot()` after `MAX_TRIAL_BOOTS` (3: the install restart plus 2 wakes, ~1 h in production). Trial boots are unattended (no setup portal), skip the cached redraw, and retry Wi-Fi 3× and each fetch 2×
 - retry limit: a version that rolls back 3 times is skipped for good (`pebl-ota` NVS: `bad_ver`, `bad_cnt`); a confirmed version clears its own history
 - status screen: "Updating firmware... vA -> vB" while downloading
 
@@ -52,6 +52,17 @@ python tools/ota_sign.py sign --firmware fw.bin --version 1.0.1 --url http://<ma
 | image never confirms (`pebl_otafail`) | `never confirmed, rolled back ... (attempt n/3)` ×3, then `OTA: skipping v9.9.9 (rolled back 3 times)` |
 
 The Python server's access log is the most reliable evidence of what was downloaded and when. Serial loses lines around the reboots.
+
+Fault injection (proves retry, no-portal and self-rollback; run it after any change to the trial-boot path):
+
+```bash
+export PEBL_OTA_STAGING_URL=http://<mac-ip>:8765/manifest.json
+PEBL_FW_VERSION=1.2.0 PEBL_FAULT_WIFI_FAILS=0 pio run -e pebl_weather_fault   # base: flash over USB
+PEBL_FW_VERSION=1.2.1 PEBL_FAULT_WIFI_FAILS=1 pio run -e pebl_weather_fault   # serve: must confirm after one retry
+PEBL_FW_VERSION=1.2.2 PEBL_FAULT_WIFI_FAILS=3 pio run -e pebl_weather_fault   # serve: must roll back 3x, then be skipped
+```
+
+Copy each `firmware.bin` out of `.pio/build/pebl_weather_fault/` before the next build, sign each served one, and swap `manifest.json` between stages. Track the server log by device IP and line number (don't write markers into a file `tee` is writing). Then read the boot log with `tools/boot_log.py`: trial boots show `trial`, `fail=wifi`, `notes=...wifi-retry-...,trial-failed-n/3,self-rollback`; rollback boots show `rolled-back-from=`. Use fresh version numbers each run, because leftover `pebl-ota` state from an earlier run is kept in NVS.
 
 Production check after a real release: `curl -sL https://github.com/willbraden/esp32/releases/download/weather-ota-stable/manifest.json` shows the version, then the device logs `OTA: up to date (running vX, channel vX)` on its next check.
 

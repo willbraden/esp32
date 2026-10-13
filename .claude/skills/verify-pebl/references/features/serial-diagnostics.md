@@ -42,7 +42,7 @@ Reset reasons:
 - `rst:0xc (RTC_SW_CPU_RST)` after `Rebooting...`: a crash (panic) reboot.
 - `rst:0x5 (DSLEEP)`: a genuine wake from deep sleep.
 
-Boot log (one line per boot, last 8 kept in NVS `pebl-boot`):
+Boot log (one line per boot, last 16 kept in NVS `pebl-boot`):
 
 ```
 #6 v1.1.0 wake=reset path=boot>wifi>loc up=13.5s wifi=12635ms next-boot=PANIC

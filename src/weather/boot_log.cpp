@@ -11,7 +11,7 @@
 namespace bootlog {
 
 static const char*   NS       = "pebl-boot";
-static const uint8_t LOG_SIZE = 8;   // archived boots kept ("h0".."h7")
+static const uint8_t LOG_SIZE = 16;  // archived boots kept ("h0".."h15")
 static const uint8_t SHOW     = 4;   // printed at boot
 
 static struct {
@@ -23,6 +23,7 @@ static struct {
     char     path[72];   // stages passed, in order: boot>wifi>loc>...
     char     fail[24];
     char     ota[32];
+    char     notes[192]; // comma-separated: retries, faults, trial failures, rollback
     int32_t  wifiMs;
 } s = {};
 
@@ -63,7 +64,7 @@ static void add(char* buf, size_t size, size_t& n, const char* fmt, ...) {
 
 static void write() {
     if (!s.started) return;
-    char line[320];   // worst case is ~240 chars
+    char line[512];   // worst case is ~440 chars
     size_t n = 0;
     add(line, sizeof(line), n, "#%lu v%s wake=%s path=%s up=%.1fs",
         (unsigned long)s.seq, FW_VERSION, s.wake, s.path, millis() / 1000.0);
@@ -72,6 +73,7 @@ static void write() {
     if (s.ota[0])       add(line, sizeof(line), n, " ota=%s", s.ota);
     if (s.trial)        add(line, sizeof(line), n, " trial");
     if (s.longPress)    add(line, sizeof(line), n, " long-press");
+    if (s.notes[0])     add(line, sizeof(line), n, " notes=%s", s.notes);
     if (s.rollback[0])  add(line, sizeof(line), n, " rolled-back-from=%s", s.rollback);
     Preferences p;
     p.begin(NS, false);
@@ -93,13 +95,13 @@ void begin(bool trial, const char* rollbackFrom) {
         prev += " next-boot=";
         prev += resetName(esp_reset_reason());
         unsigned long prevSeq = prev.startsWith("#") ? strtoul(prev.c_str() + 1, nullptr, 10) : 0;
-        char key[4];
+        char key[5];
         snprintf(key, sizeof(key), "h%u", (unsigned)(prevSeq % LOG_SIZE));
         p.putString(key, prev);
         p.remove("cur");
     }
     for (uint32_t k = seq > SHOW ? seq - SHOW : 1; k < seq; k++) {
-        char key[4], tag[16];
+        char key[5], tag[16];
         snprintf(key, sizeof(key), "h%u", (unsigned)(k % LOG_SIZE));
         snprintf(tag, sizeof(tag), "#%lu ", (unsigned long)k);
         if (!p.isKey(key)) continue;
@@ -127,5 +129,10 @@ void fail(const char* what)     { strlcpy(s.fail, what, sizeof(s.fail)); write()
 void ota(const char* result)    { strlcpy(s.ota, result, sizeof(s.ota)); write(); }
 void wifiMs(uint32_t ms)        { s.wifiMs = (int32_t)ms; write(); }
 void longPress()                { s.longPress = true; write(); }
+void note(const char* what) {
+    if (s.notes[0]) strlcat(s.notes, ",", sizeof(s.notes));
+    strlcat(s.notes, what, sizeof(s.notes));
+    write();
+}
 
 }  // namespace bootlog

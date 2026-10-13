@@ -30,7 +30,8 @@ Timer wakes take 30 minutes to occur. To prove timer behavior quickly, build wit
 
 ## Gotchas
 
-- `RTC_DATA_ATTR` (the cache, `bootCount`) survives deep sleep but is cleared by RESET and power-off. After RESET the first button press has no cache and does a full fetch. That's expected.
+- All RTC state (`bootCount`, `otaWakes`, the cache) is one struct, `rtc`, stamped with the running image's ELF SHA-256. It survives deep sleep but is cleared by RESET and power-off. After RESET the first button press has no cache and does a full fetch.
+- RTC memory is reloaded on every reset but not on a deep-sleep wake, so only the image that wrote it may read it. Every image switch currently goes through a reset (OTA install, rollback, crash), but `rtcInit()` also checks the hash and starts fresh on a mismatch (`notes=rtc-fresh` if that ever happens on a wake). Any new RTC variable goes inside `RtcState`, never as a loose `RTC_DATA_ATTR`. That's expected.
 - System time (`gettimeofday`) keeps counting through deep sleep. That's what makes the cache age correct. Nothing sets wall-clock time; the weekday comes from Open-Meteo, not the RTC.
 - `sleepUntilNext()` waits up to 5 s for USER SW to be released before arming the level-triggered wake. Otherwise a held button would wake it immediately in a loop.
 - `CachedWeather` must stay plain data. A `String` in RTC memory holds a heap pointer that is garbage after sleep.

@@ -5,7 +5,7 @@
 // Each boot keeps one text record in NVS (namespace "pebl-boot", key "cur") and
 // rewrites it as it passes each stage, so the record survives whatever ends the
 // boot: deep sleep, a panic, an OTA restart, a rollback, or a power cut. The
-// next boot archives it into a ring of the last 8 boots ("h0".."h7"), adding
+// next boot archives it into a ring of the last 16 boots ("h0".."h15"), adding
 // next-boot=<its own reset reason>, and prints the most recent ones.
 //
 // Text, not a struct, on purpose: an OTA rollback means a different image reads
@@ -35,5 +35,6 @@ void fail(const char* what);           // e.g. "wifi", "wifi+portal-timeout", "l
 void ota(const char* result);          // e.g. "up-to-date", "installing-1.2.0"
 void wifiMs(uint32_t ms);              // time spent on the direct reconnect
 void longPress();
+void note(const char* what);           // appended, e.g. "wifi-retry-2", "rtc-fresh"
 
 }  // namespace bootlog

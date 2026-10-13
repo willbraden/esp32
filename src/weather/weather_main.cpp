@@ -38,6 +38,7 @@
 #include "boot_log.h"        // persistent per-boot record (survives crashes and rollbacks)
 #include "ca_bundle.h"       // root CAs for certificate validation
 #include <esp_sleep.h>
+#include <esp_app_desc.h>
 #include <driver/gpio.h>
 #include <Preferences.h>
 #include <sys/time.h>
@@ -66,10 +67,6 @@ static const gpio_num_t PIN_USER_SW = GPIO_NUM_16;
 #endif
 #define LONG_PRESS_MS     1500    // USER SW held this long = refresh + update check
 
-RTC_DATA_ATTR int bootCount = 0;  // survives deep sleep — counts wake cycles
-// Fetch-wakes since the last update check. Starts "due" so a power-on or RESET
-// checks right away.
-RTC_DATA_ATTR int otaWakes = OTA_CHECK_EVERY_N_WAKES;
 
 enum Mode : uint8_t { MODE_NUMBERS = 0, MODE_WORD = 1, MODE_COUNT };
 
@@ -98,7 +95,37 @@ struct CachedWeather {
     bool    snow6h;
     char    day[4];
 };
-RTC_DATA_ATTR CachedWeather cache = {};
+
+// Everything that survives deep sleep, in one place. RTC memory is reloaded on
+// every reset but not on a deep-sleep wake, so it must only ever be read by the
+// image that wrote it: another image keeps its variables at other addresses
+// and would read garbage (a bad otaWakes, a bad cache drawn on screen). Today
+// every image switch goes through a reset (OTA install, rollback, crash), but
+// that depends on bootloader settings, so rtcInit() stamps the state with the
+// running image's ELF hash and starts fresh on a mismatch.
+struct RtcState {
+    uint32_t      magic;
+    char          image[17];   // first 16 hex chars of the image's ELF SHA-256
+    int           bootCount;   // wake cycles since this state was started
+    int           otaWakes;    // fetch-wakes since the last update check
+    CachedWeather cache;
+};
+static const uint32_t RTC_MAGIC = 0x9EB1C0DE;
+RTC_DATA_ATTR RtcState rtc = {};
+
+static void rtcInit() {
+    char sha[65] = {};
+    esp_app_get_elf_sha256(sha, sizeof(sha));
+    if (rtc.magic == RTC_MAGIC && strncmp(rtc.image, sha, 16) == 0) return;
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        Serial.println("RTC state written by another image: starting fresh");
+        bootlog::note("rtc-fresh");
+    }
+    memset(&rtc, 0, sizeof(rtc));
+    rtc.magic = RTC_MAGIC;
+    strlcpy(rtc.image, sha, sizeof(rtc.image));
+    rtc.otaWakes = OTA_CHECK_EVERY_N_WAKES;   // starts due: a power-on or RESET checks right away
+}
 
 // Icon categories derived from WMO weather codes
 enum Cat { CAT_CLEAR, CAT_PCLOUD, CAT_CLOUD, CAT_FOG, CAT_RAIN, CAT_SNOW, CAT_STORM };
@@ -516,25 +543,37 @@ static time_t nowSecs() {
 }
 
 static void cacheStore(const Weather& w) {
-    cache.valid = true;
-    cache.fetchedAt = nowSecs();
-    cache.temp = w.temp; cache.hi = w.hi; cache.lo = w.lo;
-    cache.code = w.code; cache.precipPct6h = w.precipPct6h; cache.snow6h = w.snow6h;
-    strlcpy(cache.day, w.day.c_str(), sizeof(cache.day));
+    rtc.cache.valid = true;
+    rtc.cache.fetchedAt = nowSecs();
+    rtc.cache.temp = w.temp; rtc.cache.hi = w.hi; rtc.cache.lo = w.lo;
+    rtc.cache.code = w.code; rtc.cache.precipPct6h = w.precipPct6h; rtc.cache.snow6h = w.snow6h;
+    strlcpy(rtc.cache.day, w.day.c_str(), sizeof(rtc.cache.day));
 }
 
 static Weather cacheLoad() {
     Weather w;
     w.ok = true;
-    w.temp = cache.temp; w.hi = cache.hi; w.lo = cache.lo;
-    w.code = cache.code; w.precipPct6h = cache.precipPct6h; w.snow6h = cache.snow6h;
-    w.day = cache.day;
+    w.temp = rtc.cache.temp; w.hi = rtc.cache.hi; w.lo = rtc.cache.lo;
+    w.code = rtc.cache.code; w.precipPct6h = rtc.cache.precipPct6h; w.snow6h = rtc.cache.snow6h;
+    w.day = rtc.cache.day;
     return w;
 }
 
 // Deep-sleep until the next scheduled refresh or a USER SW press, whichever
 // comes first.
 static void sleepUntilNext(uint32_t seconds) {
+    // Still unconfirmed? Then this boot failed its OTA trial. Deep sleep won't
+    // roll it back (the bootloader skips that on a wake), so count it here and
+    // roll back once the update has had its MAX_TRIAL_BOOTS chances.
+    if (int failed = ota::recordFailedTrial()) {
+        char n[24];
+        snprintf(n, sizeof(n), "trial-failed-%d/%d", failed, ota::MAX_TRIAL_BOOTS);
+        bootlog::note(n);
+        if (failed >= ota::MAX_TRIAL_BOOTS) {
+            bootlog::note("self-rollback");
+            ota::rollBack();
+        }
+    }
     display.hibernate();
     WiFi.disconnect(true, false);   // power down radio cleanly before sleep
     WiFi.mode(WIFI_OFF);
@@ -578,6 +617,47 @@ static uint32_t buttonHeldMs() {
     return millis() - t0;
 }
 
+// Did a person start this boot (power switch, RESET, a USB reset when
+// flashing)? Only then may the WiFi setup portal open: it blocks for minutes,
+// which must never happen unattended (a timer or button wake, a crash restart,
+// or the restart after an OTA install).
+static bool personStartedBoot() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: case ESP_RST_EXT: case ESP_RST_USB: return true;
+        default: return false;
+    }
+}
+
+// The first boot of an OTA update must fetch and draw to be confirmed, and a
+// boot that gives up rolls the update back. So that boot retries a passing
+// network problem instead of throwing a good update away.
+static const int TRIAL_WIFI_TRIES  = 3;      // with 10 s, then 20 s, between them
+static const int TRIAL_FETCH_TRIES = 2;      // 5 s apart
+
+static bool connectWiFiWithRetries(int tries, bool trial) {
+    for (int i = 0; i < tries; i++) {
+        if (i) {
+            Serial.printf("WiFi retry %d/%d\n", i + 1, tries);
+            char n[16];
+            snprintf(n, sizeof(n), "wifi-retry-%d", i + 1);
+            bootlog::note(n);
+            WiFi.disconnect(true, false);
+            delay(10000 * i);
+        }
+#ifdef FAULT_TRIAL_WIFI_FAILS
+        // Test images only (env pebl_weather_fault): fail the first N attempts
+        // of an OTA trial boot, to prove the retry and rollback paths.
+        if (trial && i < FAULT_TRIAL_WIFI_FAILS) {
+            Serial.printf("FAULT: forcing WiFi attempt %d to fail\n", i + 1);
+            bootlog::note("fault-wifi");
+            continue;
+        }
+#endif
+        if (connectWiFiDirect(WIFI_TIMEOUT_MS)) return true;
+    }
+    return false;
+}
+
 static void onOtaInstalling(const char* version) {
     char l2[48];
     snprintf(l2, sizeof(l2), "v%s -> v%s", FW_VERSION, version);
@@ -603,13 +683,20 @@ void setup() {
     Serial.printf("\n=== pebl weather v%s ===\n", FW_VERSION);
     bool trial = ota::beginBoot();
     bootlog::begin(trial, ota::rolledBackFrom());
+    rtcInit();
+    // Just rolled back from a failed update: wait for the normal check schedule
+    // (~2 h) before trying it again, so a passing problem can't use up all its
+    // attempts in a few minutes. A long press still checks at once.
+    if (ota::rolledBackFrom()) rtc.otaWakes = 0;
 
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     bool timerWake  = (wake == ESP_SLEEP_WAKEUP_TIMER);
     bool buttonWake = (wake == ESP_SLEEP_WAKEUP_EXT0);
-    bootCount++;
-    Serial.printf("Boot #%d  wake=%d %s\n", bootCount, (int)wake,
-                  timerWake ? "(TIMER WAKE)" : buttonWake ? "(USER SW)" : "(power-on/reset)");
+    bool attended   = personStartedBoot() && !trial;   // may block in the setup portal
+    rtc.bootCount++;
+    Serial.printf("Boot #%d  wake=%d %s%s\n", rtc.bootCount, (int)wake,
+                  timerWake ? "(TIMER WAKE)" : buttonWake ? "(USER SW)" : attended ? "(power-on/reset)" : "(restart)",
+                  trial ? " trial boot" : "");
 
     // USER SW: a short press flips to the other screen and remembers it; a long
     // press keeps the screen and forces a fresh fetch plus an update check.
@@ -626,8 +713,10 @@ void setup() {
 
     // A press within the refresh window redraws from the cached reading (no
     // WiFi, so the screen flips in a few seconds) and keeps the original schedule.
-    if (buttonWake && !longPress && cache.valid) {
-        time_t age = nowSecs() - cache.fetchedAt;
+    // Not on an unconfirmed update: it must fetch to prove itself, and a
+    // cached redraw would end the boot without that.
+    if (buttonWake && !longPress && rtc.cache.valid && !trial) {
+        time_t age = nowSecs() - rtc.cache.fetchedAt;
         if (age >= 0 && age < REFRESH_MINUTES * 60 - 60) {
             Serial.printf("Redrawing cached reading (%lds old)\n", (long)age);
             render(cacheLoad(), mode);
@@ -637,19 +726,19 @@ void setup() {
     }
 
     // Try a fast direct reconnect with saved creds first.
-    if (!connectWiFiDirect(WIFI_TIMEOUT_MS)) {
-        if (timerWake || buttonWake) {
-            // Unattended wake: never hang in a portal. Note it on screen and
-            // retry next cycle (so we can SEE that the wake happened on battery).
-            Serial.println("WiFi reconnect failed on wake — retry next cycle");
+    if (!connectWiFiWithRetries(trial ? TRIAL_WIFI_TRIES : 1, trial)) {
+        if (!attended) {
+            // Unattended: never hang in a portal. Note it on screen and retry
+            // next cycle (so we can SEE that the wake happened on battery).
+            Serial.println("WiFi reconnect failed — retry next cycle");
             bootlog::fail("wifi");
             char l2[40];
-            snprintf(l2, sizeof(l2), "wake #%d, retrying in %dm", bootCount, REFRESH_MINUTES);
+            snprintf(l2, sizeof(l2), "wake #%d, retrying in %dm", rtc.bootCount, REFRESH_MINUTES);
             renderMessage("WiFi reconnecting...", l2);
             sleepAndRepeat();
         }
-        // Cold boot / button press: offer the provisioning portal.
-        Serial.println("No saved WiFi — starting provisioning portal");
+        // A person just started it: offer the provisioning portal.
+        Serial.println("WiFi failed on a power-on/RESET — starting provisioning portal");
         bootlog::fail("wifi+portal");
         WiFiManager wm;
         wm.setConfigPortalTimeout(180);
@@ -662,8 +751,14 @@ void setup() {
     Serial.printf("WiFi OK: %s\n", WiFi.localIP().toString().c_str());
     bootlog::stage("wifi");
 
+    int fetchTries = trial ? TRIAL_FETCH_TRIES : 1;
     double lat = 0, lon = 0; String city;
-    if (!getLocation(lat, lon, city)) {
+    bool located = false;
+    for (int i = 0; i < fetchTries && !located; i++) {
+        if (i) { Serial.println("Location retry"); bootlog::note("loc-retry"); delay(5000); }
+        located = getLocation(lat, lon, city);
+    }
+    if (!located) {
         Serial.println("Location lookup failed");
         bootlog::fail("loc");
         renderMessage("Location error", "Will retry shortly");
@@ -673,7 +768,12 @@ void setup() {
     bootlog::stage("loc");
 
     Weather w;
-    if (!getWeather(lat, lon, w)) {
+    bool fetched = false;
+    for (int i = 0; i < fetchTries && !fetched; i++) {
+        if (i) { Serial.println("Weather retry"); bootlog::note("weather-retry"); delay(5000); }
+        fetched = getWeather(lat, lon, w);
+    }
+    if (!fetched) {
         Serial.println("Weather fetch failed");
         bootlog::fail("weather");
         renderMessage("Weather error", "Will retry shortly");
@@ -693,8 +793,8 @@ void setup() {
     // own next update: confirm it (cancels the bootloader's pending rollback).
     ota::confirmHealthy();
 
-    if (longPress || ++otaWakes >= OTA_CHECK_EVERY_N_WAKES) {
-        otaWakes = 0;
+    if (longPress || ++rtc.otaWakes >= OTA_CHECK_EVERY_N_WAKES) {
+        rtc.otaWakes = 0;
         bootlog::stage("ota");
         bootlog::ota(otaResultName(ota::checkAndInstall(onOtaInstalling)));   // restarts if it installs
     }

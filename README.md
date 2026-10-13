@@ -68,7 +68,7 @@ secret. Full procedure and safeguards:
 | `tools/weather_design.py` | Layout tool: generates the fonts and word art, and renders pixel-exact previews |
 | `tools/ota_sign.py` | Signs and verifies release manifests |
 | `tools/serial_log.py` | Serial logger that survives deep sleep |
-| `tools/boot_log.py` | Reads the device's last 8 boot records and OTA state from flash (no serial needed) |
+| `tools/boot_log.py` | Reads the device's last 16 boot records and OTA state from flash (no serial needed) |
 | `tools/test_semver.cpp` | Unit tests for version comparison |
 | `src/battprobe/`, `src/btnprobe/`, `src/netstress/`, `src/otafail/` | Diagnostic firmwares, one env each |
 | `src/wifi/`, `src/config/`, `src/main.cpp`, `data/` | WiFi tooling from the original pebl Slack client, kept as reference. Not built |
@@ -76,6 +76,5 @@ secret. Full procedure and safeguards:
 
 ## Known issues
 
-Over-the-air updates can still fail their first boot and roll back (the restart is treated
-like a power-on), and the USB serial link sometimes dies while the firmware keeps running
-(tap RESET to get it back). Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).
+The USB serial link sometimes dies while the firmware keeps running (tap RESET to get it
+back). The device itself is unaffected. Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).

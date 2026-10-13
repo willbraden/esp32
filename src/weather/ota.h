@@ -12,8 +12,13 @@
 //   * Unsigned / tampered / wrong-size images are aborted before the boot
 //     partition changes, so the running firmware stays in charge.
 //   * A new image boots in the bootloader's PENDING_VERIFY state and must call
-//     confirmHealthy() after a successful fetch + render. If it reboots before
-//     that, the bootloader rolls back to the previous image.
+//     confirmHealthy() after a successful fetch + render. If it crashes or
+//     resets before that, the bootloader rolls back to the previous image.
+//   * A deep-sleep wake does NOT roll back: the bootloader re-enters the last
+//     image without reading the OTA state (CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_
+//     DEEP_SLEEP). So an unconfirmed image counts its own failed boots
+//     (recordFailedTrial() before every sleep) and rolls itself back after
+//     MAX_TRIAL_BOOTS of them.
 //   * A version that rolls back 3 times is never downloaded again (a single
 //     rollback can be an unrelated crash, so it gets retried).
 // Publishing side: .github/workflows/weather-release.yml + tools/ota_sign.py.
@@ -45,6 +50,19 @@ const char* rolledBackFrom();
 // Mark the running image good (cancels the pending rollback). Cheap no-op when
 // the image is already confirmed.
 void confirmHealthy();
+
+// Unconfirmed boots an update gets (the install restart, then wakes) before it
+// rolls itself back.
+static const int MAX_TRIAL_BOOTS = 3;
+
+// Call before every deep sleep. If this image is still unconfirmed, this boot
+// failed its trial: counts it and returns how many have failed (1..). Returns 0
+// for a confirmed image.
+int recordFailedTrial();
+
+// Mark the running (unconfirmed) image invalid and restart into the previous
+// one. Returns only if that fails.
+void rollBack();
 
 // Check the channel and install a newer signed build. onInstalling(version) is
 // called once, just before the download starts (draw an "Updating" screen).

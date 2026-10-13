@@ -35,12 +35,12 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 
 ## Command surface
 
-- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). Each env compiles only its own `src/` folder (`build_src_filter`); give any new env one too.
+- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_weather_fault` (staging plus forced Wi-Fi failures on OTA trial boots, for proving retry and rollback; never ship it), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). Each env compiles only its own `src/` folder (`build_src_filter`); give any new env one too.
 - **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote. Full procedure in [Ship an update](#ship-an-update).
 - **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.
 - **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted. `--timeout` counts from launch, not from the boot: give it room when waiting for the user.
-- **Boot log:** the firmware keeps a record of its last 8 boots in NVS (how far each got and how it ended) and prints them at boot. Read them from flash with `tools/boot_log.py` in download mode when serial lost lines or the boot can't have a logger attached (OTA trial boots). Fields in [`serial-diagnostics.md`](references/features/serial-diagnostics.md).
+- **Boot log:** the firmware keeps a record of its last 16 boots in NVS (how far each got and how it ended) and prints them at boot. Read them from flash with `tools/boot_log.py` in download mode when serial lost lines or the boot can't have a logger attached (OTA trial boots). Fields in [`serial-diagnostics.md`](references/features/serial-diagnostics.md).
 - **Design:** `tools/weather_design.py` writes `src/weather/weather_fonts.h`, `src/weather/weather_words.h`, `tools/preview.png` and `tools/preview_words.png`, and prints the worst-case gaps.
 - **Crash decode:** `~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/<env>/firmware.elf <addrs>`. Check the `ELF file SHA256:` prefix in the panic against `shasum -a 256 firmware.elf` first. A different build decodes to the wrong lines.
 
