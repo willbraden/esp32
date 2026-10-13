@@ -38,6 +38,10 @@ static bool s_pending = false;
 bool isNewer(const char* a, const char* b) { return semver::isNewer(a, b); }
 
 // ---------------------------------------------------------------- boot state
+static char s_rolledBack[40] = "";
+
+const char* rolledBackFrom() { return s_rolledBack[0] ? s_rolledBack : nullptr; }
+
 bool beginBoot() {
     const esp_partition_t* running = esp_ota_get_running_partition();
     Preferences p;
@@ -59,6 +63,7 @@ bool beginBoot() {
             p.remove(KEY_TRY_PART);
             Serial.printf("OTA: v%s never confirmed, rolled back to v%s on %s (attempt %u/%u)\n",
                           tryVer.c_str(), FW_VERSION, running->label, n, MAX_TRIES);
+            snprintf(s_rolledBack, sizeof(s_rolledBack), "%s(attempt-%u/%u)", tryVer.c_str(), n, MAX_TRIES);
         }
     }
     p.end();

@@ -6,7 +6,7 @@ Open bugs with their evidence, and resolved ones that could come back.
 
 ### OPEN: lwIP `pbuf_free: p->ref > 0` crash, mostly on the first requests after a boot
 
-**Not fixed.** The platform upgrade to 55.03.311 (arduino-esp32 3.3.11, IDF 5.5.5) removed it from steady-state loops (0 in 90 requests in one boot, vs 10 in 55 on the old core) but the weather firmware still crashed on roughly 1 in 3 boots on the new core (2026-10-12, staging OTA test, 1-minute wakes). Each crash costs a reboot; the screen still updates. **It matters for OTA:** a crash during an update's trial boot rolls the update back (hence 3 attempts before a version is skipped).
+**Not fixed.** The platform upgrade to 55.03.311 (arduino-esp32 3.3.11, IDF 5.5.5) removed it from steady-state loops (0 in 90 requests in one boot, vs 10 in 55 on the old core) but the weather firmware still crashed on roughly 1 in 3 boots on the new core (2026-10-12, staging OTA test, 1-minute wakes). On 2026-10-13 a fresh flash crashed on **4 of 6 boots** (boot log #1–#7), all at `path=boot>wifi>loc`. Each crash costs a reboot; the screen still updates. Wi-Fi is also much slower on the boot after a crash: 7.6 s and 12.6 s against 1.6 s from a clean start. **It matters for OTA:** a crash during an update's trial boot rolls the update back (hence 3 attempts before a version is skipped).
 
 Ruled out so far: TLS (HTTPS alone never crashed), `HTTPClient` socket reuse, PSRAM buffer placement (WiFi uses static copy buffers), source-port reuse across reboots (ports are already random: 59079, 62551, 53983, ...). Next experiment: one round per boot (`pebl_netstress` v2), varying what runs first after WiFi connects.
 
@@ -22,6 +22,16 @@ History:
 ### OPEN: board occasionally wedges after a software reboot
 
 Seen twice in ~150 reboots on 2026-10-12, both right after `rst:0xc (RTC_SW_CPU_RST)` (a panic reboot and an `ESP.restart()`). The ROM line prints, then nothing; USB still enumerates but esptool gets "No serial data received". The red LED was off the first time. Only a USB replug brought it back. Cause unknown. If it hits on battery, the device stays frozen until power is cycled. OTA installs end in `ESP.restart()`, so this needs fixing before relying on unattended updates.
+
+### OPEN: OTA updates fail their trial boot
+
+`weather-v1.1.0` (fonts only) downloaded and installed, then rolled back 3 times and was skipped for good (2026-10-13; NVS `pebl-ota/bad_cnt=3`, read with esptool). It reached the device by USB instead and runs fine. One failed trial was photographed: Wi-Fi didn't connect after the install restart, the firmware treated the restart as a power-on and opened the 180 s setup portal, then slept unconfirmed, which counts as a rollback. The other two left no evidence (the boot log didn't exist yet). Three design flaws turn the crash and slow post-restart Wi-Fi above into failed updates:
+
+- The trial boot treats `sw-restart` like a power-on: it opens the setup portal instead of behaving as an unattended wake.
+- A rollback boot is a cold boot, and cold boots check for updates at once, so all 3 attempts burn within minutes.
+- Any failure on the trial boot (network included) rolls the image back, not just failures the image caused.
+
+Until these and the crash are fixed, expect most OTA releases to need a USB flash.
 
 ### RESOLVED: double full refresh on every wake
 

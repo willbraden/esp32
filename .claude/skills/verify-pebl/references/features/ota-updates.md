@@ -57,7 +57,8 @@ Production check after a real release: `curl -sL https://github.com/willbraden/e
 
 ## Gotchas
 
-- The open `pbuf_free` crash (`known-issues.md`) can hit during a trial boot and roll a good update back. That's why there are 3 attempts. In the staging test, v1.0.1 needed 2.
+- The open `pbuf_free` crash (`known-issues.md`) can hit during a trial boot and roll a good update back. That's why there are 3 attempts. In the staging test, v1.0.1 needed 2. `weather-v1.1.0` used all 3 and was skipped (see "OTA updates fail their trial boot" in `known-issues.md`).
+- After a failed update, read the board's boot log and OTA state with `tools/boot_log.py` (download mode). Trial boots run without a logger, so this is the only record of why they failed.
 - A logger that reconnects during the trial boot resets the chip, which also rolls the update back. Watch the server log instead, or attach after the confirm.
 - USB-flashing writes `boot_app0.bin` to `otadata`, which resets the boot choice to `app0`. Writing only the app at 0x10000 after an OTA leaves the device booting `app1`, the old image.
 - Never commit the private key. `ota_pubkey.h` is public on purpose.

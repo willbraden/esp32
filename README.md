@@ -68,6 +68,7 @@ secret. Full procedure and safeguards:
 | `tools/weather_design.py` | Layout tool: generates the fonts and word art, and renders pixel-exact previews |
 | `tools/ota_sign.py` | Signs and verifies release manifests |
 | `tools/serial_log.py` | Serial logger that survives deep sleep |
+| `tools/boot_log.py` | Reads the device's last 8 boot records and OTA state from flash (no serial needed) |
 | `tools/test_semver.cpp` | Unit tests for version comparison |
 | `src/battprobe/`, `src/btnprobe/`, `src/netstress/`, `src/otafail/` | Diagnostic firmwares, one env each |
 | `src/wifi/`, `src/config/`, `src/main.cpp`, `data/` | WiFi tooling from the original pebl Slack client, kept as reference. Not built |

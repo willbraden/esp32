@@ -39,7 +39,8 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 - **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote. Full procedure in [Ship an update](#ship-an-update).
 - **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.
-- **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted.
+- **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted. `--timeout` counts from launch, not from the boot: give it room when waiting for the user.
+- **Boot log:** the firmware keeps a record of its last 8 boots in NVS (how far each got and how it ended) and prints them at boot. Read them from flash with `tools/boot_log.py` in download mode when serial lost lines or the boot can't have a logger attached (OTA trial boots). Fields in [`serial-diagnostics.md`](references/features/serial-diagnostics.md).
 - **Design:** `tools/weather_design.py` writes `src/weather/weather_fonts.h`, `src/weather/weather_words.h`, `tools/preview.png` and `tools/preview_words.png`, and prints the worst-case gaps.
 - **Crash decode:** `~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/<env>/firmware.elf <addrs>`. Check the `ELF file SHA256:` prefix in the panic against `shasum -a 256 firmware.elf` first. A different build decodes to the wrong lines.
 
@@ -85,6 +86,7 @@ A claim about the device needs device evidence. "It compiled" and "the preview l
 - Show the serial lines that prove the path ran. The firmware prints a stable marker for each step, listed in [`serial-diagnostics.md`](references/features/serial-diagnostics.md): wake cause, mode, cache vs fetch, the reading, `_Update_Full`, `Sleeping`.
 - For anything visual, show the design-tool preview and ask the user for a photo of the panel. The preview proves the pixels; the photo proves the panel actually refreshed.
 - Exercise every path the change touches: cold boot, timer wake, USER SW wake (cached and stale cache), WiFi failure, fetch failure, and both screens. The feature file lists the paths.
+- When serial output stops early, the boot log is the evidence: a record whose path ends `>sleep` finished; `next-boot=PANIC` means it crashed at the end of its path.
 - A run that crashed and recovered is not a pass. Search the log for `assert failed`, `Guru Meditation`, `Rebooting...` and `rst:0xc` before calling a run clean.
 - Persistence claims (mode survives power-off) need a real power cycle with the switch, not just a RESET.
 

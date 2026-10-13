@@ -38,6 +38,10 @@ enum class Result { UpToDate, NoChannel, SkippedBad, Failed };
 // happened. Returns true if this image is a fresh update awaiting confirmation.
 bool beginBoot();
 
+// After beginBoot(): "1.2.0(attempt-2/3)" if the bootloader just rolled back
+// from that version, else nullptr. For the boot log.
+const char* rolledBackFrom();
+
 // Mark the running image good (cancels the pending rollback). Cheap no-op when
 // the image is already confirmed.
 void confirmHealthy();
