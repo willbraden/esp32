@@ -69,6 +69,7 @@ secret. Full procedure and safeguards:
 | `tools/ota_sign.py` | Signs and verifies release manifests |
 | `tools/serial_log.py` | Serial logger that survives deep sleep |
 | `tools/boot_log.py` | Reads the device's last 16 boot records and OTA state from flash (no serial needed) |
+| `tools/ota_slow_server.py` | Test-only file server that slows OTA downloads to GitHub speed |
 | `tools/test_semver.cpp` | Unit tests for version comparison |
 | `src/battprobe/`, `src/btnprobe/`, `src/netstress/`, `src/otafail/` | Diagnostic firmwares, one env each |
 | `src/wifi/`, `src/config/`, `src/main.cpp`, `data/` | WiFi tooling from the original pebl Slack client, kept as reference. Not built |
@@ -77,4 +78,6 @@ secret. Full procedure and safeguards:
 ## Known issues
 
 The USB serial link sometimes dies while the firmware keeps running (tap RESET to get it
-back). The device itself is unaffected. Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).
+back). The device itself is unaffected. Once, the first screen after an update came out
+blank; four updates since drew normally, and every refresh is now logged in case it
+returns. Details: [known-issues.md](.claude/skills/verify-pebl/references/features/known-issues.md).

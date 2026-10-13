@@ -26,7 +26,14 @@ git tag -a weather-v1.2.0 -m "pebl weather 1.2.0: <summary>" && git push willbra
 
 The device picks it up within ~2 hours. Hold USER SW ~2 s to check now. Use `weather-v1.3.0-rc.1` to send to staging devices only.
 
-First live release: `weather-v1.0.0` on 2026-10-13. The board updated itself from 0.9.0 over the air (long press) and confirmed.
+Releases so far (all 2026-10-13):
+
+| Tag | Change | Over the air |
+|---|---|---|
+| `weather-v1.0.0` | first live release | updated from 0.9.0 (long press), confirmed |
+| `weather-v1.1.0` | JetBrains Mono fonts | rolled back 3× by the `pbuf_free` crash, skipped; delivered by USB |
+| `weather-v1.1.1` | crash fix, OTA trial hardening, boot log | confirmed first time; that first draw was blank (`known-issues.md`) |
+| `weather-v1.1.2` | panel refresh timing in the boot log | confirmed first time on battery, weather drawn |
 
 One-time setup: the repo secret `PEBL_OTA_SIGNING_KEY` must hold `~/.pebl/ota_signing_key.pem` (`gh secret set PEBL_OTA_SIGNING_KEY --repo willbraden/esp32 < ~/.pebl/ota_signing_key.pem`). Back the key up somewhere safe: without it, devices can only be updated over USB.
 
@@ -52,6 +59,8 @@ python tools/ota_sign.py sign --firmware fw.bin --version 1.0.1 --url http://<ma
 | image never confirms (`pebl_otafail`) | `never confirmed, rolled back ... (attempt n/3)` ×3, then `OTA: skipping v9.9.9 (rolled back 3 times)` |
 
 The Python server's access log is the most reliable evidence of what was downloaded and when. Serial loses lines around the reboots.
+
+Watching a trial boot's screen (the blank-screen tests, 2026-10-13): build two `pebl_weather_staging` images with fresh versions (e.g. 1.3.0 and 1.3.1), flash the first over USB, and leave `manifest.json` out of the served folder until the first boot is logged (it reports `ota=no-channel`). Sign the second into a held-back manifest and copy it into place only when the user is ready (and unplugged, for a battery test). The next 1-minute wake installs it; the server log shows the `.bin` download and then the trial boot's manifest check. Ask what the panel shows, then read the boot log. For a download as slow as GitHub's, serve the `.bin` from `tools/ota_slow_server.py` (`--port 8766 --rate 24000`, ~70 s) and sign the manifest with that URL. When done, flash `pebl_weather` back over USB: a staging build only updates from the Mac.
 
 Fault injection (proves retry, no-portal and self-rollback; run it after any change to the trial-boot path):
 

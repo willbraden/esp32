@@ -14,6 +14,7 @@ The hardware facts (pin map, buttons, what is and is not on the board) are in [`
 Run `ls /dev/cu.usbmodem*` first. Whether a port exists tells you what state the chip is in.
 
 - **Port present, firmware awake** (a probe firmware, or the weather firmware mid-cycle): `pio ... -t upload` resets it into the bootloader over USB on its own.
+- **Port appears for ~10 s, then goes:** the weather firmware woke for a refresh. Auto-reset (`pio ... -t upload`, or esptool's default `--before default_reset`) still catches it. `--before no_reset` fails with `No serial data received`, because the chip isn't in download mode. Scripts that wait for the port must handle both.
 - **No port:** the weather firmware is in deep sleep (normal), or the cable is charge-only. Ask the user to **hold BOOT, tap RESET, release BOOT**, then flash. After the flash the chip sits in download mode. Start it with `esptool ... --after watchdog_reset chip_id` or ask for one RESET tap.
 - **Layout-only change:** run `tools/weather_design.py` and read the previews before flashing anything. The previews match the firmware pixel for pixel.
 
@@ -57,7 +58,7 @@ Devices update themselves from GitHub releases (design in [`ota-updates.md`](ref
    git tag -a weather-v1.0.1 -m "pebl weather 1.0.1: <one-line summary>"
    git push willbraden weather-v1.0.1
    ```
-5. **Watch the pipeline** (about 4 minutes): build, unit tests, sign, self-verify, publish, update the channel manifest.
+5. **Watch the pipeline** (about 4 minutes): build, unit tests, sign, self-verify, publish, update the channel manifest. If `gh` isn't allowed in the session, skip to step 6 and poll the channel manifest until it shows the new version.
    ```bash
    gh run list --repo willbraden/esp32 --workflow weather-release.yml --limit 1
    gh run watch <run-id> --repo willbraden/esp32 --exit-status
@@ -70,7 +71,7 @@ Devices update themselves from GitHub releases (design in [`ota-updates.md`](ref
    ~/.platformio/penv/bin/python tools/ota_sign.py verify --firmware pebl-weather-1.0.1.bin --manifest manifest.json
    ```
    (Use `weather-ota-staging` for an `-rc` tag.)
-7. **Prove it on the device.** Ask the user to hold USER SW about 2 s (or wait up to 2 h). The panel shows "Updating firmware... vOLD -> vNEW", then the weather again. **Don't attach a logger during the update**: a reset in the trial boot rolls it back. Afterwards, attach `tools/serial_log.py` and ask for one RESET tap. Expect `=== pebl weather v1.0.1 ===` and `OTA: up to date (running v1.0.1, channel v1.0.1)`. The old version plus `never confirmed, rolled back ... (attempt n/3)` means the update failed its trial boot; the device retries up to 3 times.
+7. **Prove it on the device.** Ask the user to hold USER SW about 2 s (or wait up to 2 h). The panel shows "Updating firmware... vOLD -> vNEW", then the weather again. Ask what the panel shows after the update: the weather, not a blank or status screen. **Don't attach a logger during the update**: a reset in the trial boot rolls it back. Afterwards, put the board in download mode and read `tools/boot_log.py`. Expect the install boot (`ota=installing-1.0.1 draw=...,msg:~2300ms next-boot=sw-restart`), then the trial boot (`v1.0.1 ... >drawn>ota>sleep ota=up-to-date trial draw=numbers:~2300ms`), and no `try_ver` in the OTA state (it was confirmed). `rolled-back-from=1.0.1(attempt-n/3)` means the update failed its trial boot; the device retries up to 3 times. Start the board again with `--after watchdog_reset`.
 
 Never:
 - Move, delete or reuse a published `weather-v*` tag. Devices never downgrade, so a bad release is fixed by releasing a higher version.
@@ -84,7 +85,7 @@ What OTA can't deliver: a new partition table, bootloader, or flash layout. Thos
 A claim about the device needs device evidence. "It compiled" and "the preview looks right" are not proof of on-device behavior.
 
 - Show the serial lines that prove the path ran. The firmware prints a stable marker for each step, listed in [`serial-diagnostics.md`](references/features/serial-diagnostics.md): wake cause, mode, cache vs fetch, the reading, `_Update_Full`, `Sleeping`.
-- For anything visual, show the design-tool preview and ask the user for a photo of the panel. The preview proves the pixels; the photo proves the panel actually refreshed.
+- For anything visual, show the design-tool preview and ask the user for a photo of the panel. The preview proves the pixels; the photo proves the panel actually refreshed. The boot log's `draw=<screen>:<ms>` proves a refresh ran (~2300 ms) on boots nobody watched, but not what it showed.
 - Exercise every path the change touches: cold boot, timer wake, USER SW wake (cached and stale cache), WiFi failure, fetch failure, and both screens. The feature file lists the paths.
 - When serial output stops early, the boot log is the evidence: a record whose path ends `>sleep` finished; `next-boot=PANIC` means it crashed at the end of its path.
 - A run that crashed and recovered is not a pass. Search the log for `assert failed`, `Guru Meditation`, `Rebooting...` and `rst:0xc` before calling a run clean.

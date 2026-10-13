@@ -31,6 +31,7 @@ Evidence of a good flash: `[SUCCESS]` from pio, then on serial `rst:... boot:0x8
 - `--after hard_reset` (pio's default) does not leave download mode when it was entered by the BOOT strap. Use `watchdog_reset` or a RESET tap.
 - The port name changes with the USB socket: `/dev/cu.usbmodem101` on one, `/dev/cu.usbmodem1101` on another. `platformio.ini` hardcodes 101; always pass `--upload-port`.
 - "port is busy or doesn't exist": a logger still has it open. `lsof /dev/cu.usbmodem*`, kill it, retry.
+- The port shows up for ~10 s on every refresh wake of the weather firmware. A script waiting for "the port" can grab that wake instead of the user's BOOT/RESET. Use auto-reset (`--before default_reset`), which works either way; `--before no_reset` only works in download mode.
 - No port at all and `ioreg -p IOUSB` shows no ESP device: a charge-only cable, or the board is asleep. Swap the cable before anything else.
 - The platform is pinned to pioarduino **55.03.311** (arduino-esp32 3.3.11, IDF 5.5.5) in `platformio.ini`. It needs PlatformIO Core ≥ 6.1.19 (`~/.platformio/penv/bin/pip install platformio==6.1.19`); 55.03.312 needs ≥ 6.2.0. Older platforms crash more often; see `known-issues.md`.
 - The board's flash is 4 MB. The `esp32-s3-devkitc-1` profile defaults to 8 MB and writes a header that aborts at boot. Every pebl env sets `board_upload.flash_size = 4MB` and `board_build.flash_size = 4MB`. Keep them.
