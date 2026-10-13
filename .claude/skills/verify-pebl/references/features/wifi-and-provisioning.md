@@ -1,0 +1,25 @@
+# WiFi and provisioning
+
+How the device gets online, and what it does when it can't.
+
+## Sub-features
+
+- direct-reconnect: `WiFi.begin()` with credentials saved in NVS, 25 s timeout (`WIFI_TIMEOUT_MS`)
+- provisioning-portal: WiFiManager AP `pebl-weather`, 180 s, only on cold boot / RESET
+- unattended-failure: on timer or button wakes, never open the portal; show "WiFi reconnecting..." and retry next cycle
+
+## How to get to it (user POV)
+
+First setup: power on with no saved network, join the `pebl-weather` WiFi from a phone, pick the home network. After that it's automatic. If the router is down, the panel shows "WiFi reconnecting..." with the wake number and retries in 30 minutes.
+
+## Driving it
+
+- Happy path: `WiFi OK: <ip>` within a few seconds of boot.
+- Failure on a timer/button wake: turn the router off (or test away from it), wait for a wake, and expect `WiFi reconnect failed on wake — retry next cycle` plus the "WiFi reconnecting..." screen.
+- Portal path: needs the credentials erased, which wipes the user's setup. Only with the user's explicit OK, and they have to re-provision afterward.
+
+## Gotchas
+
+- The portal blocks for up to 180 s. It must never run on unattended wakes; an earlier version froze for minutes that way. Keep the `timerWake || buttonWake` guard.
+- Dozens of `STA.cpp ... Reason: 1 - UNSPECIFIED` warnings before `WiFi OK` are normal reconnect chatter in this core. Hide them with `--quiet`.
+- Credentials live in NVS, shared with the legacy firmware's provisioning. Erasing flash (`esptool erase_flash`) removes them.
