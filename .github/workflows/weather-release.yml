@@ -1,0 +1,104 @@
+# Build, sign and publish an over-the-air update for the pebl weather firmware.
+#
+# Trigger: push a tag like weather-v1.2.0 (or weather-v1.3.0-rc.1 for staging only).
+#   git tag weather-v1.2.0 && git push willbraden weather-v1.2.0
+#
+# Output:
+#   * release weather-v1.2.0 with pebl-weather-1.2.0.bin + manifest.json
+#   * manifest.json copied to the channel release(s) the devices poll:
+#       weather-ota-stable   <- plain versions
+#       weather-ota-staging  <- every version, including -rc prereleases
+#
+# Needs the repo secret PEBL_OTA_SIGNING_KEY: the PEM private key whose public
+# half is src/weather/ota_pubkey.h. Without it the job fails before publishing.
+name: weather-release
+
+on:
+  push:
+    tags: ["weather-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weather-ota-channels      # never let two releases race on the manifests
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version and channels from the tag
+        id: v
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#weather-v}"
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::tag $TAG is not weather-vMAJOR.MINOR.PATCH[-pre]"; exit 1
+          fi
+          if [[ "$VERSION" == *-* ]]; then CHANNELS="staging"; PRE="--prerelease"; else CHANNELS="stable staging"; PRE=""; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channels=$CHANNELS" >> "$GITHUB_OUTPUT"
+          echo "pre=$PRE" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install "platformio==6.1.19"
+
+      - name: Unit tests (OTA version ordering)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -I src/weather tools/test_semver.cpp -o /tmp/test_semver
+          /tmp/test_semver
+
+      - name: Build pebl_weather
+        env:
+          PEBL_FW_VERSION: ${{ steps.v.outputs.version }}
+        run: pio run -e pebl_weather
+
+      - name: Sign
+        env:
+          PEBL_OTA_SIGNING_KEY: ${{ secrets.PEBL_OTA_SIGNING_KEY }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          cp .pio/build/pebl_weather/firmware.bin "pebl-weather-$VERSION.bin"
+          python tools/ota_sign.py sign \
+            --firmware "pebl-weather-$VERSION.bin" --version "$VERSION" \
+            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/pebl-weather-$VERSION.bin" \
+            --key-env PEBL_OTA_SIGNING_KEY --out manifest.json
+
+      - name: Verify against the public key the devices carry
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: python tools/ota_sign.py verify --firmware "pebl-weather-$VERSION.bin" --manifest manifest.json --pubkey-header src/weather/ota_pubkey.h
+
+      - name: Publish release and update channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+          CHANNELS: ${{ steps.v.outputs.channels }}
+          PRE: ${{ steps.v.outputs.pre }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "pebl-weather-$VERSION.bin" manifest.json \
+            --title "pebl weather $VERSION" --generate-notes $PRE
+          for ch in $CHANNELS; do
+            if ! gh release view "weather-ota-$ch" > /dev/null 2>&1; then
+              gh release create "weather-ota-$ch" --title "OTA channel: $ch" --prerelease --latest=false \
+                --notes "Devices on the $ch channel poll manifest.json here. Updated by the weather-release workflow; don't edit by hand."
+            fi
+            gh release upload "weather-ota-$ch" manifest.json --clobber
+            echo "channel $ch -> $VERSION"
+          done

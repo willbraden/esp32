@@ -8,7 +8,8 @@ Standalone probe builds, each with its own env and source folder. Use them to an
 |---|---|---|
 | `pebl_battprobe` | `src/battprobe/` | Battery sense. The committed version (v5) is a fast-drain monitor that shows GPIO18 on the panel every ~10 s. The earlier ADC/pull/enable-line/I2C scans were never committed; their results are in `power-and-battery.md` |
 | `pebl_btnprobe` | `src/btnprobe/` | Which pin a button is on. Samples every pin under pull-up **and** pull-down each loop, including display pins, and prints `Gn: float -> GND` style changes |
-| `pebl_netstress` | `src/netstress/` | Network crash isolation. Runs phases of HTTP-only, HTTPS-only and HTTP→HTTPS requests with a verbatim copy of `httpGet()`, counting crashes in `RTC_NOINIT` memory across panic reboots |
+| `pebl_netstress` | `src/netstress/` | Network crash isolation with a verbatim copy of `httpGet()`, counting crashes in `RTC_NOINIT` memory across reboots. v2 (current) does one round per boot then `ESP.restart()`, like an OTA trial boot, and logs each boot's source port. v1 (git history) looped many requests in one boot |
+| `pebl_otafail` | `src/otafail/` | OTA rollback test image: never confirms itself, reboots after 5 s. Ship it signed through the staging channel to prove rollback |
 
 ## How to get to it (user POV)
 

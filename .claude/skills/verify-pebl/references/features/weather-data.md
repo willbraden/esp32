@@ -35,4 +35,4 @@ Derived values:
 - `current.time` is the start of a 15-minute slot, so "@ 10:15 PM" can be up to 15 minutes old.
 - `precipitation_probability` can be null for some hours or models. Parsing defaults to 0.
 - ip-api is plain HTTP and rate-limited (45/min). The stress test stays well under that.
-- The plain-HTTP lookup triggered the `pbuf_free` crash on the old core (fixed by the platform upgrade). See `known-issues.md`.
+- The `pbuf_free` crash fires right after this lookup on about 1 in 3 boots (open). See `known-issues.md`.

@@ -8,6 +8,7 @@ USER SW switches between the numbers screen (mode 0) and the word screen (mode 1
 - toggle: mode = (mode + 1) % `MODE_COUNT`, saved before drawing
 - persistence: NVS namespace `pebl-weather`, key `mode` (uchar); survives sleep, RESET and power-off
 - fast-redraw: uses the RTC cache, no WiFi (see `wake-and-sleep-cycle.md`)
+- long-press: held ≥ 1.5 s after the wake (hold ~2 s): keep the screen, force a fresh fetch and an OTA check
 - release-wait: sleep is armed only after the button is released (≤ 5 s)
 - cs-protection: GPIO16 drive strength set to `GPIO_DRIVE_CAP_0` while it's acting as CS
 

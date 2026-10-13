@@ -43,6 +43,7 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 - [weekday-bar](weekday-bar.md): Inverted weekday strip, the stale-screen cue shared by both screens.
 - [mode-button](mode-button.md): USER SW on GPIO16, wake-on-press, mode toggle and NVS persistence.
 - [status-screens](status-screens.md): WiFi, location and weather error screens.
+- [ota-updates](ota-updates.md): Signed over-the-air updates from GitHub releases: channels, trial boot, rollback, staging rig.
 
 ## Tooling
 
@@ -51,7 +52,7 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 
 ## Open problems and legacy
 
-- [known-issues](known-issues.md): Open bugs with evidence, and resolved ones that could come back (the lwIP `pbuf_free` crash fixed by the platform upgrade, the double refresh).
+- [known-issues](known-issues.md): Open bugs with evidence (the lwIP `pbuf_free` crash after boot, the post-reboot wedge) and resolved ones that could come back.
 - [legacy-pebl-client](legacy-pebl-client.md): The original Slack/Discord client still in `src/`, and why it is untested here.
 
 ## Multi-surface journeys

@@ -35,7 +35,9 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 
 ## Command surface
 
-- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress` (diagnostics). The `lilygo_*` envs are the legacy pebl client and are not verified on this board.
+- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics).
+- **Release (OTA):** `git tag weather-vX.Y.Z && git push willbraden main weather-vX.Y.Z`. CI builds, signs and publishes; devices pick it up within ~2 h. See `ota-updates.md`.
+- **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`. The `lilygo_*` envs are the legacy pebl client and are not verified on this board.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.
 - **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted.
 - **Design:** `tools/weather_design.py` writes `src/weather/weather_fonts.h`, `src/weather/weather_words.h`, `tools/preview.png` and `tools/preview_words.png`, and prints the worst-case gaps.
