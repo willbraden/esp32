@@ -406,7 +406,7 @@ static void renderWeather(const Weather& w) {
     const int RIGHT_X   = W - 8;        // current temp + condition are right-aligned to here
     const int HI_BASE   = 56;           // High baseline (top aligned with the big temp's top)
     const int LO_BASE   = 103;          // Low baseline  (aligned with the condition baseline)
-    const int CUR_BASE  = 78;           // big current temp baseline (right)
+    const int CUR_BASE  = 76;           // big current temp baseline (right; top level with Hi)
     const int COND_BASE = 103;          // condition word baseline (right)
 
     display.setTextColor(GxEPD_BLACK);

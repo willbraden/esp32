@@ -30,5 +30,6 @@ Edit the CONFIG block (fonts, `H_*` sizes, baselines, `PREVIEW`, `WORST`, `WORDS
 
 - Font sizes are set by the pixel height of the digit "8", not by point size.
 - The header is overwritten on every run. Never hand-edit `weather_fonts.h` or `weather_words.h`.
-- Fonts come from `/System/Library/Fonts/Supplemental/` (Arial Bold), so the tool only runs on macOS unless you point the paths elsewhere. The generated headers are committed, so building doesn't need the tool.
+- Every generated font and word is JetBrains Mono Bold v2.304, kept in `tools/fonts/` with its OFL license, so the tool runs anywhere. The generated headers are committed, so building doesn't need the tool. Monospace digits are wide: the 3-digit Hi next to a 3-digit current temp is the binding case (exactly 8 px at Hi 37 / big 57).
+- The status screens (`renderMessage()`) still use the built-in FreeSans 9 pt; the tool doesn't generate those.
 - Preview and firmware share maths but not code. If you change placement in one, change the other. Both have comments pointing at each other.

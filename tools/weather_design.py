@@ -4,7 +4,7 @@ weather_design.py — edit the pebl weather display's fonts & preview the layout
 
 WHAT THIS DOES
   1. Converts the TTF fonts into the Adafruit-GFX header the firmware uses
-     (writes src/weather/dimitri_fonts.h).
+     (writes src/weather/weather_fonts.h).
   2. Renders a 1-bit preview PNG of the layout (tools/preview.png) — exactly how
      the e-ink panel will show it — so you can iterate WITHOUT flashing.
 
@@ -27,15 +27,19 @@ from PIL import Image, ImageDraw
 
 # ============================ CONFIG — EDIT ME ============================
 # Font files (any .ttf). Swap these to try a totally different typeface.
-FONT_BIG  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # big current temp
-FONT_HL   = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # Hi / Lo
-FONT_COND = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # condition word
-FONT_DAY  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # weekday letters in the bar
+# JetBrains Mono Bold v2.304 (SIL OFL 1.1, tools/fonts/JetBrainsMono-OFL.txt),
+# kept in the repo so the output doesn't depend on what's installed.
+FONT_MAIN = "tools/fonts/JetBrainsMono-Bold.ttf"
+FONT_BIG  = FONT_MAIN  # big current temp
+FONT_HL   = FONT_MAIN  # Hi / Lo
+FONT_COND = FONT_MAIN  # condition word
+FONT_DAY  = FONT_MAIN  # weekday letters in the bar
 
 # Glyph height in pixels for each element (bigger = bigger text).
 # Sized so the WORST case below keeps >= 8px between neighbours (width-bound:
-# a 3-digit Hi next to a 3-digit current temp is exactly 8px apart).
-H_BIG  = 59   # current temp
+# a 3-digit Hi next to a 3-digit current temp is exactly 8px apart; JetBrains
+# Mono's digits are wider than Arial's, so the big temp dropped from 59 to 57).
+H_BIG  = 57   # current temp
 H_HL   = 37   # Hi / Lo
 H_COND = 17   # condition word
 H_DAY  = 11   # weekday letters (cap height)
@@ -49,13 +53,13 @@ LEFT_X    = BAR_W + 8  # Hi/Lo left edge
 RIGHT_X   = 250 - 8  # right edge that the temp + condition align to
 HI_BASE   = 56       # Hi baseline   (top aligned with the big temp's top)
 LO_BASE   = 103      # Lo baseline   (aligned with the condition baseline)
-CUR_BASE  = 78       # current-temp baseline
+CUR_BASE  = 76       # current-temp baseline (top = 76 - 57 = 19, level with Hi)
 COND_BASE = 103      # condition baseline
 
 # ---- word mode (USER SW toggles between the numbers screen and this) ----
 # Each word is rendered as its own bitmap, scaled to the largest size that fits
 # the box right of the bar (so short words like HOT come out bigger than CHILLY).
-FONT_WORD  = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+FONT_WORD  = FONT_MAIN
 WORD_BOX   = (BAR_W + 8, 8, 250 - 8, 122 - 8)   # x0, y0, x1, y1 (8px margins)
 WORDS      = ["SNOW", "RAIN", "FREEZE", "COLD", "CHILLY", "HOT", "HELL"]
 SHADES_W   = 190      # sunglasses icon width (height follows its 2.5:1 shape)

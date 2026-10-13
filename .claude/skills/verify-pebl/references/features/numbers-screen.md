@@ -5,7 +5,7 @@ Mode 0. Today's high and low stacked on the left, the big current temperature on
 ## Sub-features
 
 - hi-lo: Hi over Lo, left-aligned at `LEFT_X = BAR_W + 8 = 27`, 37 px digits (`WeatherHL`)
-- current-temp: right-aligned at `RIGHT_X = 242`, 59 px digits (`WeatherBig`), no degree sign
+- current-temp: right-aligned at `RIGHT_X = 242`, 57 px digits (`WeatherBig`, JetBrains Mono Bold like every generated font), no degree sign
 - condition: one word right-aligned under the temp, 17 px (`WeatherCond`): Clear, Cloudy, Fog, Rain, Snow, Storm
 - weekday-bar: left strip, see `weekday-bar.md`
 
@@ -21,7 +21,7 @@ Layout knobs (`renderWeather()` and the CONFIG block in `tools/weather_design.py
 |---|---|---|
 | `HI_BASE` | 56 | Hi top lines up with the big temp's top (y = 19) |
 | `LO_BASE` | 103 | Lo baseline = condition baseline |
-| `CUR_BASE` | 78 | |
+| `CUR_BASE` | 76 | top at 19, level with Hi |
 | `COND_BASE` | 103 | 8 px below the big temp |
 
 Both columns are 84 px tall, centered (y = 19…103). Sizes were solved so the worst case (3-digit Hi beside a 3-digit current temp, e.g. 108 / 102) still leaves exactly 8 px. The tool prints `worst gaps: Hi->big 8px ...` on every run; any value under 8 is a regression.
