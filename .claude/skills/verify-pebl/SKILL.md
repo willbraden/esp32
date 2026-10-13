@@ -1,6 +1,6 @@
 ---
 name: verify-pebl
-description: "Build, flash, drive and prove changes on the pebl ESP32-S3 e-ink weather display (env pebl_weather). Use when verifying firmware behavior on the real board: flashing and recovery, serial evidence, wake/sleep, the numbers and word screens, the USER SW mode button, and layout changes via tools/weather_design.py. Also the reference for the board's pin map and hardware."
+description: "Build, flash, drive and prove changes on the pebl ESP32-S3 e-ink weather display (env pebl_weather). Use when verifying firmware behavior on the real board: flashing and recovery, serial evidence, wake/sleep, the numbers and word screens, the USER SW mode button, and layout changes via tools/weather_design.py. Also use when shipping a firmware update to devices (weather-v* release tags, OTA). Also the reference for the board's pin map and hardware."
 ---
 
 # Verify pebl
@@ -35,13 +35,48 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 
 ## Command surface
 
-- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics).
-- **Release (OTA):** `git tag weather-vX.Y.Z && git push willbraden main weather-vX.Y.Z`. CI builds, signs and publishes; devices pick it up within ~2 h. See `ota-updates.md`.
-- **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`. The `lilygo_*` envs are the legacy pebl client and are not verified on this board.
+- **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). The `lilygo_*` envs are the legacy pebl client and are not verified on this board.
+- **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote. Full procedure in [Ship an update](#ship-an-update).
+- **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.
 - **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted.
 - **Design:** `tools/weather_design.py` writes `src/weather/weather_fonts.h`, `src/weather/weather_words.h`, `tools/preview.png` and `tools/preview_words.png`, and prints the worst-case gaps.
 - **Crash decode:** `~/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/<env>/firmware.elf <addrs>`. Check the `ELF file SHA256:` prefix in the panic against `shasum -a 256 firmware.elf` first. A different build decodes to the wrong lines.
+
+## Ship an update
+
+Devices update themselves from GitHub releases (design in [`ota-updates.md`](references/features/ota-updates.md)). Releases come only from the pipeline, never flashed from a laptop. **A tag publishes to every device, so get the user's OK before pushing one.**
+
+1. **Prove the change first** (proof bar below). If it touches networking, OTA, boot, sleep or the partition layout, also run the staging rig in `ota-updates.md`.
+2. **Pick the version:** the next semver after `git describe --tags --match 'weather-v*' --abbrev=0`. Patch for fixes, minor for features or new screens, major for anything that changes what a device must already have. Add `-rc.N` (e.g. `weather-v1.2.0-rc.1`) to ship to the staging channel only.
+3. **Commit as the user.** The author must be `willbraden <willbraden@gmail.com>` and nobody else: no `Co-Authored-By` trailers in this repo (the user's rule).
+4. **Push and tag.** The remote is named `willbraden`, not `origin`:
+   ```bash
+   git push willbraden main
+   git tag -a weather-v1.0.1 -m "pebl weather 1.0.1: <one-line summary>"
+   git push willbraden weather-v1.0.1
+   ```
+5. **Watch the pipeline** (about 4 minutes): build, unit tests, sign, self-verify, publish, update the channel manifest.
+   ```bash
+   gh run list --repo willbraden/esp32 --workflow weather-release.yml --limit 1
+   gh run watch <run-id> --repo willbraden/esp32 --exit-status
+   ```
+6. **Check what was published**, independently of CI:
+   ```bash
+   curl -sL https://github.com/willbraden/esp32/releases/download/weather-ota-stable/manifest.json
+   curl -sLO https://github.com/willbraden/esp32/releases/download/weather-v1.0.1/pebl-weather-1.0.1.bin
+   curl -sL -o manifest.json https://github.com/willbraden/esp32/releases/download/weather-ota-stable/manifest.json
+   ~/.platformio/penv/bin/python tools/ota_sign.py verify --firmware pebl-weather-1.0.1.bin --manifest manifest.json
+   ```
+   (Use `weather-ota-staging` for an `-rc` tag.)
+7. **Prove it on the device.** Ask the user to hold USER SW about 2 s (or wait up to 2 h). The panel shows "Updating firmware... vOLD -> vNEW", then the weather again. **Don't attach a logger during the update**: a reset in the trial boot rolls it back. Afterwards, attach `tools/serial_log.py` and ask for one RESET tap. Expect `=== pebl weather v1.0.1 ===` and `OTA: up to date (running v1.0.1, channel v1.0.1)`. The old version plus `never confirmed, rolled back ... (attempt n/3)` means the update failed its trial boot; the device retries up to 3 times.
+
+Never:
+- Move, delete or reuse a published `weather-v*` tag. Devices never downgrade, so a bad release is fixed by releasing a higher version.
+- Edit the `weather-ota-stable` / `weather-ota-staging` channel releases by hand. The workflow owns them.
+- Commit, print or paste the private key (`~/.pebl/ota_signing_key.pem`, the `PEBL_OTA_SIGNING_KEY` secret). The user keeps a backup in their password manager.
+
+What OTA can't deliver: a new partition table, bootloader, or flash layout. Those need a USB flash of every device. Rotating the signing key is possible over the air: ship one release signed with the **old** key that carries the **new** `ota_pubkey.h`, then replace the secret. Devices that miss that release need USB.
 
 ## Proof bar
 

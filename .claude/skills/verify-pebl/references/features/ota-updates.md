@@ -17,13 +17,16 @@ Partition table (`partitions.csv`): two 1,984 KB app slots (`app0`, `app1`) + `o
 
 ## How to get to it (user POV)
 
-Ship an update:
+Ship an update: follow **Ship an update** in [`SKILL.md`](../../SKILL.md) (version choice, annotated tag pushed to the `willbraden` remote, watching CI, verifying the published files, proving it on the device). Short form:
 
 ```bash
-git tag weather-v1.2.0 && git push willbraden main weather-v1.2.0
+git push willbraden main
+git tag -a weather-v1.2.0 -m "pebl weather 1.2.0: <summary>" && git push willbraden weather-v1.2.0
 ```
 
 The device picks it up within ~2 hours. Hold USER SW ~2 s to check now. Use `weather-v1.3.0-rc.1` to send to staging devices only.
+
+First live release: `weather-v1.0.0` on 2026-10-13. The board updated itself from 0.9.0 over the air (long press) and confirmed.
 
 One-time setup: the repo secret `PEBL_OTA_SIGNING_KEY` must hold `~/.pebl/ota_signing_key.pem` (`gh secret set PEBL_OTA_SIGNING_KEY --repo willbraden/esp32 < ~/.pebl/ota_signing_key.pem`). Back the key up somewhere safe: without it, devices can only be updated over USB.
 
