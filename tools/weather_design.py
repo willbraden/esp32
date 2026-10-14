@@ -56,6 +56,14 @@ LO_BASE   = 103      # Lo baseline   (aligned with the condition baseline)
 CUR_BASE  = 76       # current-temp baseline (top = 76 - 57 = 19, level with Hi)
 COND_BASE = 103      # condition baseline
 
+# ---- tomorrow screen (replaces both screens between sunset and sunrise) ----
+# A small "Tomorrow" (condition font) over tomorrow's low-high range in the big
+# current-temp font, or the Hi/Lo font when that is too wide (3-digit temps).
+# Both centred in the box right of the bar, the pair centred vertically.
+# Must match renderTomorrow().
+TMRW_GAP = 10           # label bottom -> range top. With the big font: y=19..103
+PREVIEW_TMRW_PNG = "tools/preview_tomorrow.png"
+
 # ---- word mode (USER SW toggles between the numbers screen and this) ----
 # Each word is rendered as its own bitmap, scaled to the largest size that fits
 # the box right of the bar (so short words like HOT come out bigger than CHILLY).
@@ -67,10 +75,12 @@ WORDS_HEADER = "src/weather/weather_words.h"
 WORDS_PNG    = "tools/preview_words.png"
 
 # What to show in the preview (change to test different values / longest words).
-PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON")
+PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON",
+               tmrw=["46-63", "98-102"], tmrw_day="TUE")
 # Worst cases checked for collisions on every run.
 WORST = dict(nums=["108", "-18"], conds=["Cloudy", "Storm", "Clear", "Rain", "Snow", "Fog"],
-             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
+             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
+             ranges=["108-112", "98-102", "-18/-5", "-5/12", "99-99"])
 # ========================================================================
 
 DPI = 141                       # matches Adafruit fontconvert
@@ -174,6 +184,21 @@ def day_layout(day, f):
     return out
 
 
+def centre_pen(f, s):
+    """Pen x that centres the ink in the box right of the bar (mirrors renderTomorrow())."""
+    x0, _, x1, _ = WORD_BOX
+    ix, w = ink(f, s)
+    return x0 + (x1 - x0 - w) // 2 - ix
+
+
+def tmrw_layout(big, hl, rng):
+    """(range font, its height, label baseline, range baseline) - mirrors renderTomorrow()."""
+    x0, _, x1, _ = WORD_BOX
+    f, h = (big, H_BIG) if ink(big, rng)[1] <= x1 - x0 else (hl, H_HL)
+    top = (122 - (H_COND + TMRW_GAP + h)) // 2
+    return f, h, top + H_COND, top + H_COND + TMRW_GAP + h
+
+
 def check(big, hl, cond, day):
     """Print the tightest gaps for the worst-case strings."""
     hlRight = max(LEFT_X + sum(ink(hl, n)) for n in WORST['nums'])      # ink right edge
@@ -184,6 +209,12 @@ def check(big, hl, cond, day):
           f"Lo->cond {cndLeft - hlRight}px, "
           f"Hi->Lo {LO_BASE - H_HL - HI_BASE}px, big->cond {COND_BASE - H_COND - CUR_BASE}px, "
           f"day letter margin {(BAR_W - wDay) / 2:.1f}px")
+    x0, _, x1, _ = WORD_BOX
+    for r in WORST['ranges']:
+        f, h, _, _ = tmrw_layout(big, hl, r)
+        w = ink(f, r)[1]
+        print(f"tomorrow {r}: {h}px font, {w}px of {x1 - x0}px")
+        assert w <= x1 - x0, f"tomorrow range {r} overflows the box"
 
 
 # ----------------------------- word mode art -----------------------------
@@ -319,6 +350,23 @@ def main():
     img.resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)
     night(img).resize((1000, 488), Image.NEAREST).save(PREVIEW_NIGHT_PNG)
     print(f"wrote {PREVIEW_PNG} and {PREVIEW_NIGHT_PNG}  (open them to see the layout)")
+
+    # Tomorrow screen: only ever shown at night, so preview it in the night
+    # theme. One screen per PREVIEW range, stacked (big font, then the fallback).
+    rngs = PREVIEW['tmrw']
+    sheet = Image.new("L", (1000, len(rngs) * 498), 255)
+    for i, r in enumerate(rngs):
+        img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
+        for c, (x, y) in zip(PREVIEW['tmrw_day'], day_layout(PREVIEW['tmrw_day'], day)):
+            blit(d, day, c, x, y, fill=236)
+        f, _, lb, rb = tmrw_layout(big, hl, r)
+        blit(d, cond, "Tomorrow", centre_pen(cond, "Tomorrow"), lb)
+        blit(d, f, r, centre_pen(f, r), rb)
+        img = img.point(lambda x: 0 if x < 128 else 236)
+        sheet.paste(night(img).resize((1000, 488), Image.NEAREST), (0, i * 498))
+    sheet.save(PREVIEW_TMRW_PNG)
+    print(f"wrote {PREVIEW_TMRW_PNG}")
 
     # Word mode: every word on its own screen, stacked into one sheet,
     # day on the left and night on the right.

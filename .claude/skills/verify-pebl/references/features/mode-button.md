@@ -6,6 +6,7 @@ USER SW switches between the numbers screen (mode 0) and the word screen (mode 1
 
 - wake-on-press: ext0 wake on GPIO16 LOW from deep sleep
 - toggle: mode = (mode + 1) % `MODE_COUNT`, saved before drawing
+- night-peek: when the cached reading is night, a short press swaps between the tomorrow screen and the saved mode instead, and leaves the mode alone (see `tomorrow-screen.md`)
 - persistence: NVS namespace `pebl-weather`, key `mode` (uchar); survives sleep, RESET and power-off
 - fast-redraw: uses the RTC cache, no WiFi (see `wake-and-sleep-cycle.md`)
 - long-press: held ≥ 1.5 s after the wake (hold ~2 s): keep the screen, force a fresh fetch and an OTA check

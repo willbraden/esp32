@@ -2,6 +2,8 @@
 
 Between sunset and sunrise, the numbers and word screens draw white on black: the day screen with every pixel inverted, weekday bar included (it turns white with black letters). Status screens ("WiFi reconnecting...", "Updating firmware...", errors) always use the day theme.
 
+By default the tomorrow screen (`tomorrow-screen.md`) replaces both screens at night, so the inverted numbers and word screens show when a short press peeks at them, or with `NIGHT_TOMORROW=0`.
+
 ## Sub-features
 
 - trigger: Open-Meteo `current.is_day` for the reading's location. `0` means night. A missing field means day.
