@@ -13,6 +13,8 @@
 //     numbers screen and a one-word screen (SNOW / RAIN / FREEZE / COLD / CHILLY /
 //     sunglasses / HOT / HELL). The choice is saved in NVS. Holding it ~2 s
 //     forces a fresh fetch and an update check instead.
+//   * Between sunset and sunrise both screens give way to tomorrow's low-high
+//     ("Tomorrow / 46-63"); a short press peeks at the normal screen.
 //   * Updates itself over WiFi from signed GitHub releases (see ota.h).
 //
 // Build: env `pebl_weather` (board esp32-s3-devkitc-1). Confirmed display pins
@@ -69,6 +71,9 @@ static const gpio_num_t PIN_USER_SW = GPIO_NUM_16;
 #ifndef NIGHT_INVERT
 #define NIGHT_INVERT      1       // 1 = white-on-black screens between sunset and sunrise
 #endif
+#ifndef NIGHT_TOMORROW
+#define NIGHT_TOMORROW    1       // 1 = show tomorrow's low-high between sunset and sunrise
+#endif
 
 
 enum Mode : uint8_t { MODE_NUMBERS = 0, MODE_WORD = 1, MODE_COUNT };
@@ -119,6 +124,8 @@ struct Weather {
     int    precipPct6h = 0;   // highest precipitation probability over the next 6 hours
     bool   snow6h = false;    // any snowfall / snow weather code in those 6 hours
     bool   night = false;     // Open-Meteo is_day == 0: the sun is down at the reading
+    float  tmrwHi = 0, tmrwLo = 0;   // the next day's high/low (see getWeather())
+    String tmrwDay = "";             // its weekday, "TUE"
 };
 
 // Last successful reading, kept in RTC memory across deep sleep so a button
@@ -131,6 +138,8 @@ struct CachedWeather {
     bool    snow6h;
     bool    night;
     char    day[4];
+    float   tmrwHi, tmrwLo;
+    char    tmrwDay[4];
 };
 
 // Everything that survives deep sleep, in one place. RTC memory is reloaded on
@@ -145,6 +154,7 @@ struct RtcState {
     char          image[17];   // first 16 hex chars of the image's ELF SHA-256
     int           bootCount;   // wake cycles since this state was started
     int           otaWakes;    // fetch-wakes since the last update check
+    bool          nightPeek;   // a short press at night swapped tomorrow for the normal screen
     CachedWeather cache;
 };
 static const uint32_t RTC_MAGIC = 0x9EB1C0DE;
@@ -281,7 +291,7 @@ static bool getWeather(double lat, double lon, Weather& w) {
         "&current=temperature_2m,weather_code,is_day"
         "&daily=temperature_2m_max,temperature_2m_min"
         "&hourly=precipitation_probability,snowfall,weather_code&forecast_hours=6"
-        "&temperature_unit=%s&timezone=auto&forecast_days=1",
+        "&temperature_unit=%s&timezone=auto&forecast_days=2",
         lat, lon, USE_FAHRENHEIT ? "fahrenheit" : "celsius");
 
     String body = httpGet(url, true);
@@ -313,6 +323,16 @@ static bool getWeather(double lat, double lon, Weather& w) {
     if (tpos == 10)
         w.day = weekdayAbbr(t.substring(0, 4).toInt(), t.substring(5, 7).toInt(),
                             t.substring(8, 10).toInt());
+
+    // "Tomorrow" for the night screen is the next day you wake up to: the next
+    // date before midnight, but today's date in the small hours.
+    int idx = (tpos >= 0 && t.substring(tpos + 1, tpos + 3).toInt() < 12) ? 0 : 1;
+    w.tmrwHi = doc["daily"]["temperature_2m_max"][idx] | w.hi;
+    w.tmrwLo = doc["daily"]["temperature_2m_min"][idx] | w.lo;
+    String d = String((const char*)(doc["daily"]["time"][idx] | ""));   // "2026-06-14"
+    if (d.length() == 10)
+        w.tmrwDay = weekdayAbbr(d.substring(0, 4).toInt(), d.substring(5, 7).toInt(),
+                                d.substring(8, 10).toInt());
     w.ok = true;
     return true;
 }
@@ -471,6 +491,36 @@ static void renderWord(const Weather& w) {
     drawDone(w.night && NIGHT_INVERT ? "word-night" : "word");
 }
 
+// Night screen: "Tomorrow" over the next day's low-high, both centred in the
+// box right of the bar. Mirrors the tomorrow preview in tools/weather_design.py.
+static void renderTomorrow(const Weather& w) {
+    const int LABEL_BASE = 47;   // TMRW_LABEL_BASE in the tool
+    const int RANGE_BASE = 98;   // TMRW_RANGE_BASE in the tool
+    int lo = (int)lroundf(w.tmrwLo), hi = (int)lroundf(w.tmrwHi);
+    char range[16];
+    // "46-63"; a slash once the low is negative, so "-5--2" can't happen
+    snprintf(range, sizeof(range), lo < 0 ? "%d/%d" : "%d-%d", lo, hi);
+
+    display.setTextColor(INK);
+    display.setFullWindow();
+    drawStart();
+    display.firstPage();
+    do {
+        display.fillScreen(PAPER);
+        drawDayBar(w.tmrwDay, BAR_W, DAY_CAP, DAY_GAP);
+        int16_t bx, by; uint16_t bw, bh;
+        display.setFont(&WeatherTmrw);
+        display.getTextBounds("Tomorrow", 0, 0, &bx, &by, &bw, &bh);
+        display.setCursor(WORD_BOX_X0 + (WORD_BOX_X1 - WORD_BOX_X0 - (int)bw) / 2 - bx, LABEL_BASE);
+        display.print("Tomorrow");
+        display.setFont(&WeatherHL);
+        display.getTextBounds(range, 0, 0, &bx, &by, &bw, &bh);
+        display.setCursor(WORD_BOX_X0 + (WORD_BOX_X1 - WORD_BOX_X0 - (int)bw) / 2 - bx, RANGE_BASE);
+        display.print(range);
+    } while (display.nextPage());
+    drawDone(NIGHT_INVERT ? "tomorrow-night" : "tomorrow");
+}
+
 static void renderWeather(const Weather& w) {
     int W = display.width();
     // ---- LAYOUT KNOBS (keep in sync with tools/weather_design.py) ----
@@ -576,9 +626,14 @@ static void saveMode(Mode m) {
     p.end();
 }
 
+// At night the tomorrow screen replaces both screens, unless a short press
+// asked to peek at the normal one.
+static bool showTomorrow(bool night) { return NIGHT_TOMORROW && night && !rtc.nightPeek; }
+
 static void render(const Weather& w, Mode m) {
     setTheme(w.night);
-    if (m == MODE_WORD) renderWord(w);
+    if (showTomorrow(w.night)) renderTomorrow(w);
+    else if (m == MODE_WORD) renderWord(w);
     else                renderWeather(w);
 }
 
@@ -596,6 +651,8 @@ static void cacheStore(const Weather& w) {
     rtc.cache.code = w.code; rtc.cache.precipPct6h = w.precipPct6h; rtc.cache.snow6h = w.snow6h;
     rtc.cache.night = w.night;
     strlcpy(rtc.cache.day, w.day.c_str(), sizeof(rtc.cache.day));
+    rtc.cache.tmrwHi = w.tmrwHi; rtc.cache.tmrwLo = w.tmrwLo;
+    strlcpy(rtc.cache.tmrwDay, w.tmrwDay.c_str(), sizeof(rtc.cache.tmrwDay));
 }
 
 static Weather cacheLoad() {
@@ -605,6 +662,8 @@ static Weather cacheLoad() {
     w.code = rtc.cache.code; w.precipPct6h = rtc.cache.precipPct6h; w.snow6h = rtc.cache.snow6h;
     w.night = rtc.cache.night;
     w.day = rtc.cache.day;
+    w.tmrwHi = rtc.cache.tmrwHi; w.tmrwLo = rtc.cache.tmrwLo;
+    w.tmrwDay = rtc.cache.tmrwDay;
     return w;
 }
 
@@ -749,14 +808,22 @@ void setup() {
 
     // USER SW: a short press flips to the other screen and remembers it; a long
     // press keeps the screen and forces a fresh fetch plus an update check.
+    // At night a short press instead swaps between tomorrow and the normal
+    // screen; the next timer wake or long press goes back to tomorrow.
     bool longPress = buttonWake && buttonHeldMs() >= LONG_PRESS_MS;
     Mode mode = loadMode();
     if (buttonWake && !longPress) {
-        mode = (Mode)((mode + 1) % MODE_COUNT);
-        saveMode(mode);
+        if (NIGHT_TOMORROW && rtc.cache.valid && rtc.cache.night) {
+            rtc.nightPeek = !rtc.nightPeek;
+        } else {
+            mode = (Mode)((mode + 1) % MODE_COUNT);
+            saveMode(mode);
+        }
+    } else {
+        rtc.nightPeek = false;
     }
     if (longPress) { Serial.println("Long press: refresh + update check"); bootlog::longPress(); }
-    Serial.printf("Mode %d\n", (int)mode);
+    Serial.printf("Mode %d%s\n", (int)mode, rtc.nightPeek ? " (night peek)" : "");
 
     initDisplay();
 
@@ -832,6 +899,7 @@ void setup() {
     Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  precip6h %d%%%s  @ %s %s %s\n",
                   w.temp, w.hi, w.lo, w.code, w.precipPct6h, w.snow6h ? " (snow)" : "",
                   w.day.c_str(), w.updated.c_str(), w.night ? "night" : "day");
+    Serial.printf("Tomorrow %s  Lo %.1f  Hi %.1f\n", w.tmrwDay.c_str(), w.tmrwLo, w.tmrwHi);
 
     bootlog::stage("weather");
     cacheStore(w);

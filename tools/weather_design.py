@@ -34,6 +34,7 @@ FONT_BIG  = FONT_MAIN  # big current temp
 FONT_HL   = FONT_MAIN  # Hi / Lo
 FONT_COND = FONT_MAIN  # condition word
 FONT_DAY  = FONT_MAIN  # weekday letters in the bar
+FONT_TMRW = FONT_MAIN  # "Tomorrow" on the night screen
 
 # Glyph height in pixels for each element (bigger = bigger text).
 # Sized so the WORST case below keeps >= 8px between neighbours (width-bound:
@@ -43,6 +44,7 @@ H_BIG  = 57   # current temp
 H_HL   = 37   # Hi / Lo
 H_COND = 17   # condition word
 H_DAY  = 11   # weekday letters (cap height)
+H_TMRW = 24   # "Tomorrow" label on the night screen
 
 # Layout positions (must match the LAYOUT KNOBS in weather_main.cpp).
 # Screen is 250 wide x 122 tall. y values are text BASELINES.
@@ -56,6 +58,13 @@ LO_BASE   = 103      # Lo baseline   (aligned with the condition baseline)
 CUR_BASE  = 76       # current-temp baseline (top = 76 - 57 = 19, level with Hi)
 COND_BASE = 103      # condition baseline
 
+# ---- tomorrow screen (replaces both screens between sunset and sunrise) ----
+# "Tomorrow" over tomorrow's low-high range (range in the Hi/Lo font), both
+# centred in the box right of the bar. Must match renderTomorrow().
+TMRW_LABEL_BASE = 47    # top = 47 - 24 = 23
+TMRW_RANGE_BASE = 98    # 14px under the label; bottom 98, so the pair is centred
+PREVIEW_TMRW_PNG = "tools/preview_tomorrow.png"
+
 # ---- word mode (USER SW toggles between the numbers screen and this) ----
 # Each word is rendered as its own bitmap, scaled to the largest size that fits
 # the box right of the bar (so short words like HOT come out bigger than CHILLY).
@@ -67,15 +76,18 @@ WORDS_HEADER = "src/weather/weather_words.h"
 WORDS_PNG    = "tools/preview_words.png"
 
 # What to show in the preview (change to test different values / longest words).
-PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON")
+PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON",
+               tmrw="46-63", tmrw_day="TUE")
 # Worst cases checked for collisions on every run.
 WORST = dict(nums=["108", "-18"], conds=["Cloudy", "Storm", "Clear", "Rain", "Snow", "Fog"],
-             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"])
+             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
+             ranges=["108-112", "-18/-5", "-5/12"])
 # ========================================================================
 
 DPI = 141                       # matches Adafruit fontconvert
 FIRST, LAST = 0x20, 0x7E        # printable ASCII
-STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond", day="WeatherDay")
+STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond", day="WeatherDay",
+               tmrw="WeatherTmrw")
 HEADER  = "src/weather/weather_fonts.h"
 PREVIEW_PNG = "tools/preview.png"
 PREVIEW_NIGHT_PNG = "tools/preview_night.png"
@@ -174,7 +186,14 @@ def day_layout(day, f):
     return out
 
 
-def check(big, hl, cond, day):
+def centre_pen(f, s):
+    """Pen x that centres the ink in the box right of the bar (mirrors renderTomorrow())."""
+    x0, _, x1, _ = WORD_BOX
+    ix, w = ink(f, s)
+    return x0 + (x1 - x0 - w) // 2 - ix
+
+
+def check(big, hl, cond, day, tmrw):
     """Print the tightest gaps for the worst-case strings."""
     hlRight = max(LEFT_X + sum(ink(hl, n)) for n in WORST['nums'])      # ink right edge
     bigLeft = min(right_pen(big, n) + ink(big, n)[0] for n in WORST['nums'])
@@ -184,6 +203,11 @@ def check(big, hl, cond, day):
           f"Lo->cond {cndLeft - hlRight}px, "
           f"Hi->Lo {LO_BASE - H_HL - HI_BASE}px, big->cond {COND_BASE - H_COND - CUR_BASE}px, "
           f"day letter margin {(BAR_W - wDay) / 2:.1f}px")
+    x0, _, x1, _ = WORD_BOX
+    wR = max(ink(hl, r)[1] for r in WORST['ranges']); wL = ink(tmrw, "Tomorrow")[1]
+    print(f"tomorrow: label {wL}px, widest range {wR}px, box {x1 - x0}px, "
+          f"label->range {TMRW_RANGE_BASE - H_HL - TMRW_LABEL_BASE}px")
+    assert max(wR, wL) <= x1 - x0, "tomorrow screen text overflows the box"
 
 
 # ----------------------------- word mode art -----------------------------
@@ -298,14 +322,16 @@ def main():
     hl   = convert(FONT_HL,   STRUCTS['hl'],   H_HL)
     cond = convert(FONT_COND, STRUCTS['cond'], H_COND)
     day  = convert(FONT_DAY,  STRUCTS['day'],  H_DAY)
+    tmrw = convert(FONT_TMRW, STRUCTS['tmrw'], H_TMRW)
 
     with open(HEADER, "w") as fh:
         fh.write("#pragma once\n#include <Adafruit_GFX.h>\n\n"
                  + emit(big) + "\n\n" + emit(hl) + "\n\n" + emit(cond) + "\n\n"
-                 + emit(day) + "\n")
+                 + emit(day) + "\n\n" + emit(tmrw) + "\n")
     print(f"wrote {HEADER}  (BIG {len(big['bitmaps'])}B, HL {len(hl['bitmaps'])}B, "
-          f"COND {len(cond['bitmaps'])}B, DAY {len(day['bitmaps'])}B)")
-    check(big, hl, cond, day)
+          f"COND {len(cond['bitmaps'])}B, DAY {len(day['bitmaps'])}B, "
+          f"TMRW {len(tmrw['bitmaps'])}B)")
+    check(big, hl, cond, day, tmrw)
 
     img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)   # e-ink gray
     d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
@@ -319,6 +345,17 @@ def main():
     img.resize((1000, 488), Image.NEAREST).save(PREVIEW_PNG)
     night(img).resize((1000, 488), Image.NEAREST).save(PREVIEW_NIGHT_PNG)
     print(f"wrote {PREVIEW_PNG} and {PREVIEW_NIGHT_PNG}  (open them to see the layout)")
+
+    # Tomorrow screen: only ever shown at night, so preview it in the night theme.
+    img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
+    for c, (x, y) in zip(PREVIEW['tmrw_day'], day_layout(PREVIEW['tmrw_day'], day)):
+        blit(d, day, c, x, y, fill=236)
+    blit(d, tmrw, "Tomorrow", centre_pen(tmrw, "Tomorrow"), TMRW_LABEL_BASE)
+    blit(d, hl, PREVIEW['tmrw'], centre_pen(hl, PREVIEW['tmrw']), TMRW_RANGE_BASE)
+    img = img.point(lambda x: 0 if x < 128 else 236)
+    night(img).resize((1000, 488), Image.NEAREST).save(PREVIEW_TMRW_PNG)
+    print(f"wrote {PREVIEW_TMRW_PNG}")
 
     # Word mode: every word on its own screen, stacked into one sheet,
     # day on the left and night on the right.

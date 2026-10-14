@@ -7,7 +7,7 @@ Where every number on the screen comes from.
 - geolocation: `http://ip-api.com/json/?fields=status,lat,lon,city` (no key, plain HTTP)
 - forecast: Open-Meteo `https://api.open-meteo.com/v1/forecast` (no key, TLS with `setInsecure()`)
 - current: `temperature_2m`, `weather_code`, `is_day` (picks the night theme, see `night-mode.md`), and `current.time` (location-local, gives the weekday)
-- daily: `temperature_2m_max/min` for today (Hi/Lo)
+- daily: `temperature_2m_max/min` with `forecast_days=2`. Day 0 is today (Hi/Lo). The tomorrow screen uses day 1 after noon and day 0 before noon (see `tomorrow-screen.md`)
 - next-6h: hourly `precipitation_probability`, `snowfall`, `weather_code` with `forecast_hours=6` (starts at the current hour, crosses midnight)
 - units: `temperature_unit=fahrenheit` (`USE_FAHRENHEIT 1`), `timezone=auto`
 
@@ -20,10 +20,10 @@ Automatic. Location follows the network's public IP, so a VPN or a carrier IP ca
 Check the API directly from the Mac:
 
 ```bash
-curl -s "https://api.open-meteo.com/v1/forecast?latitude=39.4895&longitude=-104.8447&current=temperature_2m,weather_code,is_day&daily=temperature_2m_max,temperature_2m_min&hourly=precipitation_probability,snowfall,weather_code&forecast_hours=6&temperature_unit=fahrenheit&timezone=auto&forecast_days=1" | python3 -m json.tool
+curl -s "https://api.open-meteo.com/v1/forecast?latitude=39.4895&longitude=-104.8447&current=temperature_2m,weather_code,is_day&daily=temperature_2m_max,temperature_2m_min&hourly=precipitation_probability,snowfall,weather_code&forecast_hours=6&temperature_unit=fahrenheit&timezone=auto&forecast_days=2" | python3 -m json.tool
 ```
 
-On device, the `Temp ... precip6h P% (snow) @ DAY time day|night` line is the parsed result. Compare it against the curl output for the same 15-minute slot.
+On device, the `Temp ... precip6h P% (snow) @ DAY time day|night` line is the parsed result, and `Tomorrow DAY  Lo L  Hi H` follows it. Compare it against the curl output for the same 15-minute slot.
 
 Derived values:
 - `precipPct6h` = max hourly probability over the window

@@ -39,6 +39,7 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 - [wifi-and-provisioning](wifi-and-provisioning.md): Saved-credential reconnect, the `pebl-weather` portal, failure behavior per wake cause.
 - [weather-data](weather-data.md): IP geolocation and the Open-Meteo request: fields, units, the 6-hour precipitation window.
 - [night-mode](night-mode.md): White-on-black screens between sunset and sunrise, driven by `is_day`.
+- [tomorrow-screen](tomorrow-screen.md): "Tomorrow" over the next day's low-high, in place of both screens at night.
 - [numbers-screen](numbers-screen.md): High/low, big current temp, condition word, layout and worst-case gaps.
 - [word-screen](word-screen.md): One-word screen (SNOW/RAIN/FREEZE/COLD/CHILLY/sunglasses/HOT/HELL) and its rules.
 - [weekday-bar](weekday-bar.md): Inverted weekday strip, the stale-screen cue shared by both screens.
