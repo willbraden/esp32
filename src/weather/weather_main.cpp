@@ -491,15 +491,26 @@ static void renderWord(const Weather& w) {
     drawDone(w.night && NIGHT_INVERT ? "word-night" : "word");
 }
 
-// Night screen: "Tomorrow" over the next day's low-high, both centred in the
-// box right of the bar. Mirrors the tomorrow preview in tools/weather_design.py.
+// Night screen: a small "Tomorrow" over the next day's low-high in the big
+// current-temp font (the Hi/Lo font when a 3-digit temp makes that too wide),
+// both centred in the box right of the bar. Mirrors tmrw_layout() in
+// tools/weather_design.py.
 static void renderTomorrow(const Weather& w) {
-    const int LABEL_BASE = 47;   // TMRW_LABEL_BASE in the tool
-    const int RANGE_BASE = 98;   // TMRW_RANGE_BASE in the tool
+    const int H_LABEL = 17, H_BIG = 57, H_HL = 37;   // font heights (H_COND/H_BIG/H_HL in the tool)
+    const int GAP = 10;                              // TMRW_GAP in the tool
+    const int BOX_W = WORD_BOX_X1 - WORD_BOX_X0;
     int lo = (int)lroundf(w.tmrwLo), hi = (int)lroundf(w.tmrwHi);
     char range[16];
     // "46-63"; a slash once the low is negative, so "-5--2" can't happen
     snprintf(range, sizeof(range), lo < 0 ? "%d/%d" : "%d-%d", lo, hi);
+
+    int16_t bx, by; uint16_t bw, bh;
+    display.setFont(&WeatherBig);
+    display.getTextBounds(range, 0, 0, &bx, &by, &bw, &bh);
+    bool big = (int)bw <= BOX_W;
+    int h = big ? H_BIG : H_HL;
+    int labelBase = (display.height() - (H_LABEL + GAP + h)) / 2 + H_LABEL;
+    int rangeBase = labelBase + GAP + h;
 
     display.setTextColor(INK);
     display.setFullWindow();
@@ -508,14 +519,13 @@ static void renderTomorrow(const Weather& w) {
     do {
         display.fillScreen(PAPER);
         drawDayBar(w.tmrwDay, BAR_W, DAY_CAP, DAY_GAP);
-        int16_t bx, by; uint16_t bw, bh;
-        display.setFont(&WeatherTmrw);
+        display.setFont(&WeatherCond);
         display.getTextBounds("Tomorrow", 0, 0, &bx, &by, &bw, &bh);
-        display.setCursor(WORD_BOX_X0 + (WORD_BOX_X1 - WORD_BOX_X0 - (int)bw) / 2 - bx, LABEL_BASE);
+        display.setCursor(WORD_BOX_X0 + (BOX_W - (int)bw) / 2 - bx, labelBase);
         display.print("Tomorrow");
-        display.setFont(&WeatherHL);
+        display.setFont(big ? &WeatherBig : &WeatherHL);
         display.getTextBounds(range, 0, 0, &bx, &by, &bw, &bh);
-        display.setCursor(WORD_BOX_X0 + (WORD_BOX_X1 - WORD_BOX_X0 - (int)bw) / 2 - bx, RANGE_BASE);
+        display.setCursor(WORD_BOX_X0 + (BOX_W - (int)bw) / 2 - bx, rangeBase);
         display.print(range);
     } while (display.nextPage());
     drawDone(NIGHT_INVERT ? "tomorrow-night" : "tomorrow");
