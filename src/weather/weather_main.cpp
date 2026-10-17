@@ -6,7 +6,8 @@
 //
 //   * Reuses the WiFi credentials already provisioned on the device (falls back
 //     to a captive-portal "pebl-weather" AP if none are saved).
-//   * Auto-detects location by IP (ip-api.com) — no config needed.
+//   * Uses the fixed HOME_LAT/HOME_LON when the build sets them (platformio.ini),
+//     else locates itself by IP (ip-api.com), which can be miles off.
 //   * Fetches current conditions + daily high/low from Open-Meteo (free, no key).
 //   * Renders a clean weather card, then deep-sleeps REFRESH_MINUTES and repeats.
 //   * USER SW (GPIO16, shared with the display's CS line) toggles between the
@@ -254,6 +255,12 @@ static String httpGet(const String& url, bool secure) {
 
 // ----- data fetch -----
 static bool getLocation(double& lat, double& lon, String& city) {
+#if defined(HOME_LAT) && defined(HOME_LON)
+    // IP geolocation lands on the ISP's hub, which put a Denver device in
+    // Castle Rock: 18 miles south and ~800 ft higher, so a few degrees cold.
+    lat = HOME_LAT; lon = HOME_LON; city = "home";
+    return true;
+#endif
     String body = httpGet("http://ip-api.com/json/?fields=status,lat,lon,city", false);
     if (body.isEmpty()) return false;
     JsonDocument doc;
