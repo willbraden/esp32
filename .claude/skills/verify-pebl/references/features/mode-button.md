@@ -26,6 +26,8 @@ Press and release USER SW once. The panel refreshes to the other screen in a few
 
 Verified 2026-10-12: one press → CHILLY, second press → numbers.
 
+Long press verified 2026-10-18 on v1.4.1: a ~2 s hold kept the numbers screen and refreshed. Boot log #368: `wake=button path=boot>wifi>loc>weather>drawn>ota>sleep ota=up-to-date held=1501ms long-press`.
+
 ## Gotchas
 
 - Up to v1.4.0 the hold was timed only after the boot preamble (`delay(300)`, OTA and boot-log NVS work, serial output), so the preamble's time didn't count and a ~2 s hold could read as a short press (seen 2026-10-18 on v1.3.1: holding ~2 s flipped the screen). Fixed in v1.4.1 by timing from app start. To update a device that's still on the old firmware, flip the power switch or tap RESET: every power-on checks for updates.
