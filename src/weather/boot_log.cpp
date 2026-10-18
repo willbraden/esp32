@@ -18,6 +18,7 @@ static struct {
     bool     started;
     uint32_t seq;
     bool     trial, longPress;
+    int32_t  heldMs;     // USER SW hold measured from the wake, -1 when not a button wake
     const char* wake;
     char     rollback[40];
     char     path[72];   // stages passed, in order: boot>wifi>loc>...
@@ -74,6 +75,7 @@ static void write() {
     if (s.fail[0])      add(line, sizeof(line), n, " fail=%s", s.fail);
     if (s.ota[0])       add(line, sizeof(line), n, " ota=%s", s.ota);
     if (s.trial)        add(line, sizeof(line), n, " trial");
+    if (s.heldMs >= 0)  add(line, sizeof(line), n, " held=%ldms", (long)s.heldMs);
     if (s.longPress)    add(line, sizeof(line), n, " long-press");
     if (s.draws[0])     add(line, sizeof(line), n, " draw=%s usb=%s", s.draws, s.usbHost ? "host" : "none");
     if (s.notes[0])     add(line, sizeof(line), n, " notes=%s", s.notes);
@@ -120,6 +122,7 @@ void begin(bool trial, const char* rollbackFrom) {
     strlcpy(s.rollback, rollbackFrom ? rollbackFrom : "", sizeof(s.rollback));
     strlcpy(s.path, "boot", sizeof(s.path));
     s.wifiMs = -1;
+    s.heldMs = -1;
     s.usbHost = -1;
     write();
 }
@@ -132,7 +135,11 @@ void stage(const char* name) {
 void fail(const char* what)     { strlcpy(s.fail, what, sizeof(s.fail)); write(); }
 void ota(const char* result)    { strlcpy(s.ota, result, sizeof(s.ota)); write(); }
 void wifiMs(uint32_t ms)        { s.wifiMs = (int32_t)ms; write(); }
-void longPress()                { s.longPress = true; write(); }
+void button(uint32_t heldMs, bool longPress) {
+    s.heldMs = (int32_t)heldMs;
+    s.longPress = longPress;
+    write();
+}
 void note(const char* what) {
     if (s.notes[0]) strlcat(s.notes, ",", sizeof(s.notes));
     strlcat(s.notes, what, sizeof(s.notes));

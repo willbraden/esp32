@@ -34,7 +34,7 @@ void stage(const char* name);
 void fail(const char* what);           // e.g. "wifi", "wifi+portal-timeout", "loc"
 void ota(const char* result);          // e.g. "up-to-date", "installing-1.2.0"
 void wifiMs(uint32_t ms);              // time spent on the direct reconnect
-void longPress();
+void button(uint32_t heldMs, bool longPress);   // a USER SW wake: how long it was held
 void note(const char* what);           // appended, e.g. "wifi-retry-2", "rtc-fresh"
 // A finished screen refresh: which screen ("numbers", "word", "msg"), how long
 // the panel held BUSY (~2300 ms is a real full refresh), and whether a USB host

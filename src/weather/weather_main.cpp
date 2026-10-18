@@ -736,14 +736,18 @@ static bool connectWiFiDirect(uint32_t timeoutMs) {
     return WiFi.status() == WL_CONNECTED;
 }
 
-// How long USER SW is still held after an ext0 wake (the pin is left in RTC
-// mode by the wake, so hand it back to the digital GPIO matrix first).
-static uint32_t buttonHeldMs() {
+// How long USER SW was held after an ext0 wake, counted from the start of the
+// app (millis() 0) so the time the press spent waking the chip counts towards
+// it. The ROM and bootloader run before millis() starts, so a hold is slightly
+// undercounted, never overcounted. Waits at most until LONG_PRESS_MS; it was a
+// long press if the button is still down then. (The pin is left in RTC mode by
+// the wake, so hand it back to the digital GPIO matrix first.)
+static uint32_t buttonHeldMs(bool& longPress) {
     rtc_gpio_deinit(PIN_USER_SW);
     pinMode(PIN_USER_SW, INPUT);
-    uint32_t t0 = millis();
-    while (digitalRead(PIN_USER_SW) == LOW && millis() - t0 < LONG_PRESS_MS) delay(10);
-    return millis() - t0;
+    while (digitalRead(PIN_USER_SW) == LOW && millis() < LONG_PRESS_MS) delay(10);
+    longPress = digitalRead(PIN_USER_SW) == LOW;
+    return millis();
 }
 
 // Did a person start this boot (power switch, RESET, a USB reset when
@@ -807,6 +811,14 @@ static const char* otaResultName(ota::Result r) {
 }
 
 void setup() {
+    // Time USER SW before anything else. It used to be timed after the boot
+    // work below (USB serial, NVS, the boot log), which ate into the hold, so a
+    // ~2 s press could come out short and flip the screen instead.
+    esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+    bool buttonWake = (wake == ESP_SLEEP_WAKEUP_EXT0);
+    bool longPress = false;
+    uint32_t heldMs = buttonWake ? buttonHeldMs(longPress) : 0;
+
     Serial.begin(115200);
     delay(300);
     Serial.printf("\n=== pebl weather v%s ===\n", FW_VERSION);
@@ -818,9 +830,7 @@ void setup() {
     // attempts in a few minutes. A long press still checks at once.
     if (ota::rolledBackFrom()) rtc.otaWakes = 0;
 
-    esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     bool timerWake  = (wake == ESP_SLEEP_WAKEUP_TIMER);
-    bool buttonWake = (wake == ESP_SLEEP_WAKEUP_EXT0);
     bool attended   = personStartedBoot() && !trial;   // may block in the setup portal
     rtc.bootCount++;
     Serial.printf("Boot #%d  wake=%d %s%s\n", rtc.bootCount, (int)wake,
@@ -831,7 +841,6 @@ void setup() {
     // press keeps the screen and forces a fresh fetch plus an update check.
     // At night a short press instead swaps between tomorrow and the normal
     // screen; the next timer wake or long press goes back to tomorrow.
-    bool longPress = buttonWake && buttonHeldMs() >= LONG_PRESS_MS;
     Mode mode = loadMode();
     if (buttonWake && !longPress) {
         if (NIGHT_TOMORROW && rtc.cache.valid && rtc.cache.night) {
@@ -843,7 +852,11 @@ void setup() {
     } else {
         rtc.nightPeek = false;
     }
-    if (longPress) { Serial.println("Long press: refresh + update check"); bootlog::longPress(); }
+    if (buttonWake) {
+        Serial.printf("USER SW held %lums%s\n", (unsigned long)heldMs,
+                      longPress ? ": long press, refresh + update check" : "");
+        bootlog::button(heldMs, longPress);
+    }
     Serial.printf("Mode %d%s\n", (int)mode, rtc.nightPeek ? " (night peek)" : "");
 
     initDisplay();

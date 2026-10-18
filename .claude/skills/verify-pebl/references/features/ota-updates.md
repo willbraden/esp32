@@ -4,7 +4,7 @@ The device updates itself from signed GitHub releases. Code: `src/weather/ota.{h
 
 ## Sub-features
 
-- pull-check: after a successful fetch + render, fetch the channel manifest every `OTA_CHECK_EVERY_N_WAKES` (4 → ~2 h), on every power-on or RESET, but not on the boot right after a rollback (the next try waits for the normal schedule), and on a USER SW long press (≥ 1.5 s after wake)
+- pull-check: after a successful fetch + render, fetch the channel manifest every `OTA_CHECK_EVERY_N_WAKES` (4 → ~2 h), on every power-on or RESET, but not on the boot right after a rollback (the next try waits for the normal schedule), and on a USER SW long press (still held 1.5 s after the app starts)
 - channels: `weather-ota-stable` (plain versions) and `weather-ota-staging` (also `-rc` prereleases), set at build time by `OTA_CHANNEL_URL`
 - version gate: install only if the manifest version is newer (`semver.h`, unit-tested by `tools/test_semver.cpp`); local builds are `X.Y.Z+dev...`, which equals its tag
 - download: HTTPS with certificate validation (embedded Mozilla bundle), following GitHub's redirect, streamed into the spare app slot, hashed as it arrives
