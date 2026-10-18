@@ -42,7 +42,7 @@ Walk this list top to bottom, then `multi-surface-journeys.md`.
 - [tomorrow-screen](tomorrow-screen.md): "Tomorrow" over the next day's low-high, in place of both screens at night.
 - [numbers-screen](numbers-screen.md): High/low, big current temp, condition word, layout and worst-case gaps.
 - [word-screen](word-screen.md): One-word screen (SNOW/RAIN/FREEZE/COLD/CHILLY/sunglasses/HOT/HELL) and its rules.
-- [weekday-bar](weekday-bar.md): Inverted weekday strip, the stale-screen cue shared by both screens.
+- [weekday-letter](weekday-letter.md): Weekday letter on the bottom row, positioned like a week ruler; the stale-screen cue shared by every screen.
 - [mode-button](mode-button.md): USER SW on GPIO16, wake-on-press, mode toggle and NVS persistence.
 - [status-screens](status-screens.md): WiFi, location and weather error screens.
 - [ota-updates](ota-updates.md): Signed over-the-air updates from GitHub releases: channels, trial boot, rollback, staging rig.

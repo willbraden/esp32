@@ -6,7 +6,7 @@ back to deep sleep. It needs no account, no API key and no computer once it's fl
 
 - **Location:** found automatically from the network's IP address (ip-api.com)
 - **Weather:** current temperature, today's high/low and conditions from Open-Meteo
-- **Two screens:** numbers (big Hi/Lo, current temp, conditions, an inverted weekday bar
+- **Two screens:** numbers (big Hi/Lo, current temp, conditions, a weekday letter
   that shows how old the reading is) or one word (SNOW / RAIN / FREEZE / COLD / CHILLY /
   sunglasses / HOT / HELL)
 - **USER SW button:** press to switch screens (saved across power-off). Hold ~2 s to

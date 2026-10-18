@@ -7,7 +7,7 @@ Runs that cross several features. Per-feature details live in the linked files; 
 1. Flash `pebl_weather` (`flashing-and-recovery.md`), start it, and log with `--until Sleeping`.
 2. Expect, in order: `wake=0 (power-on/reset)`, `Mode M`, `WiFi OK`, `Loc:`, `Temp ...`, exactly one `_Update_Full`, `Drew numbers: panel busy ~2284ms` (or `word`), `Sleeping 1800s`.
 3. No `assert failed` / `Rebooting...` in between. If there is one, it's the open crash in `known-issues.md`; report it, don't call the run clean.
-4. Panel photo matches the saved mode's screen, with today's weekday in the bar.
+4. Panel photo matches the saved mode's screen, with today's weekday letter on the bottom row.
 
 ## Mode round trip with persistence
 
@@ -39,4 +39,4 @@ Passed for `weather-v1.1.2` on 2026-10-13. The same run on `weather-v1.1.1` once
 
 ## Dead-battery cue
 
-Not practical to run on demand (the forced drain took about 8 hours). The proof is that the weekday comes from the reading's date: when the device stops updating, the bar keeps the last reading's weekday. Covered by `weekday-bar.md`.
+Not practical to run on demand (the forced drain took about 8 hours). The proof is that the weekday comes from the reading's date: when the device stops updating, the letter keeps the last reading's weekday. Covered by `weekday-letter.md`.

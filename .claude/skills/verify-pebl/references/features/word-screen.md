@@ -8,7 +8,7 @@ Mode 1. One large word (or a sunglasses icon) that sums up the weather, readable
 - temp-words: by current temperature (°F), contiguous ranges
 - shades-icon: sunglasses silhouette for 70–84°F
 - fit-to-box: each word is its own bitmap, scaled to the largest size that fits the box
-- weekday-bar: same left strip as the numbers screen
+- weekday-letter: same bottom row as the numbers screen
 
 Rules (`wordArtFor()`), first match wins:
 
@@ -33,7 +33,7 @@ Press USER SW from the numbers screen. The choice is remembered through sleep, R
 
 - Every word: `tools/preview_words.png` (all eight screens, rendered from the same bitmaps the firmware draws). That covers words you can't produce on demand (HELL, SNOW).
 - On device: switch to mode 1, then check that the word on the panel matches the rules applied to the `Temp ... precip6h` line.
-- Art lives in `src/weather/weather_words.h`, generated. Sizes as of 2026-10-13 (JetBrains Mono Bold): SNOW 214×70, RAIN 211×69, FREEZE 212×44, COLD 211×71, CHILLY 215×46, HOT 215×96, HELL 213×69, SHADES 190×76. Box is x 27–242, y 8–114.
+- Art lives in `src/weather/weather_words.h`, generated. Sizes as of 2026-10-18 (JetBrains Mono Bold): SNOW 233×75, RAIN 233×76, FREEZE 230×50, COLD 234×78, CHILLY 234×52, HOT 187×84, HELL 232×74, SHADES 190×76. Box is the content block, x 8–242, y 9–93.
 
 ## Gotchas
 

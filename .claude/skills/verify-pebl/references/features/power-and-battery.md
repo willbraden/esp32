@@ -6,12 +6,12 @@ What the board does on battery, and the proven fact that firmware cannot read th
 
 - battery-run: LiPo keeps the board running with USB unplugged; the power switch cuts it
 - no-battery-sense: there is no way to read voltage or percentage from firmware (proven)
-- stale-cue: the weekday bar is the software stand-in for a low-battery warning
+- stale-cue: the weekday letter is the software stand-in for a low-battery warning
 - divider-option: the hardware change that would add a real reading
 
 ## How to get to it (user POV)
 
-Unplug USB with the switch on: the display keeps updating every 30 minutes until the cell is empty. Then the last image stays on the panel indefinitely (e-ink needs no power to hold it). The weekday in the left bar stops matching today. That's the only sign.
+Unplug USB with the switch on: the display keeps updating every 30 minutes until the cell is empty. Then the last image stays on the panel indefinitely (e-ink needs no power to hold it). The weekday letter on the bottom row stops matching today. That's the only sign.
 
 ## Driving it
 

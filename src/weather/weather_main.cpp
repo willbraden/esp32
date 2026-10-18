@@ -121,12 +121,12 @@ struct Weather {
     int    code = 0;
     String city = "";
     String updated = "";   // "3:45 PM"
-    String day = "";       // "MON" — location-local weekday of the reading
+    int    day = -1;       // location-local weekday of the reading, 0=Sun..6=Sat (-1 unknown)
     int    precipPct6h = 0;   // highest precipitation probability over the next 6 hours
     bool   snow6h = false;    // any snowfall / snow weather code in those 6 hours
     bool   night = false;     // Open-Meteo is_day == 0: the sun is down at the reading
     float  tmrwHi = 0, tmrwLo = 0;   // the next day's high/low (see getWeather())
-    String tmrwDay = "";             // its weekday, "TUE"
+    int    tmrwDay = -1;             // its weekday, 0=Sun..6=Sat
 };
 
 // Last successful reading, kept in RTC memory across deep sleep so a button
@@ -138,9 +138,9 @@ struct CachedWeather {
     int     code, precipPct6h;
     bool    snow6h;
     bool    night;
-    char    day[4];
+    int8_t  day;
     float   tmrwHi, tmrwLo;
-    char    tmrwDay[4];
+    int8_t  tmrwDay;
 };
 
 // Everything that survives deep sleep, in one place. RTC memory is reloaded on
@@ -282,13 +282,17 @@ static String to12h(const String& hm) {        // "15:45" -> "3:45 PM"
     return String(h12) + ":" + m + " " + ap;
 }
 
-// Three-letter weekday for a Gregorian date (Sakamoto's method).
-static const char* weekdayAbbr(int y, int m, int d) {
-    static const char* const names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+// Weekday of a Gregorian date, 0=Sun..6=Sat, or -1 for a bad date (Sakamoto's method).
+static int weekdayOf(int y, int m, int d) {
     static const int offs[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    if (m < 1 || m > 12 || d < 1 || d > 31) return "";
+    if (m < 1 || m > 12 || d < 1 || d > 31) return -1;
     if (m < 3) y--;
-    return names[(y + y / 4 - y / 100 + y / 400 + offs[m - 1] + d) % 7];
+    return (y + y / 4 - y / 100 + y / 400 + offs[m - 1] + d) % 7;
+}
+
+static const char* weekdayName(int wd) {
+    static const char* const names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    return (wd >= 0 && wd < 7) ? names[wd] : "?";
 }
 
 static bool getWeather(double lat, double lon, Weather& w) {
@@ -328,7 +332,7 @@ static bool getWeather(double lat, double lon, Weather& w) {
     // Weekday of the reading, shown so a stale screen (dead battery) is obvious.
     // Open-Meteo already returns location-local time (timezone=auto).
     if (tpos == 10)
-        w.day = weekdayAbbr(t.substring(0, 4).toInt(), t.substring(5, 7).toInt(),
+        w.day = weekdayOf(t.substring(0, 4).toInt(), t.substring(5, 7).toInt(),
                             t.substring(8, 10).toInt());
 
     // "Tomorrow" for the night screen is the next day you wake up to: the next
@@ -338,7 +342,7 @@ static bool getWeather(double lat, double lon, Weather& w) {
     w.tmrwLo = doc["daily"]["temperature_2m_min"][idx] | w.lo;
     String d = String((const char*)(doc["daily"]["time"][idx] | ""));   // "2026-06-14"
     if (d.length() == 10)
-        w.tmrwDay = weekdayAbbr(d.substring(0, 4).toInt(), d.substring(5, 7).toInt(),
+        w.tmrwDay = weekdayOf(d.substring(0, 4).toInt(), d.substring(5, 7).toInt(),
                                 d.substring(8, 10).toInt());
     w.ok = true;
     return true;
@@ -457,30 +461,31 @@ static const WordArt& wordArtFor(const Weather& w) {
     return ART_HELL;
 }
 
-// Inverted weekday bar on the left edge: white letters stacked top-to-bottom,
-// each centred in the bar, the stack centred vertically. Mirrors day_layout()
-// in tools/weather_design.py.
-static void drawDayBar(const String& day, int barW, int capH, int gap) {
-    int H = display.height();
-    display.fillRect(0, 0, barW, H, INK);
-    display.setFont(&WeatherDay);
-    display.setTextColor(PAPER);
-    int n = day.length();
-    int top = (H - (n * capH + (n - 1) * gap)) / 2;
-    for (int i = 0; i < n; i++) {
-        char c[2] = {day[i], 0};
-        int16_t bx, by; uint16_t bw, bh;
-        display.getTextBounds(c, 0, 0, &bx, &by, &bw, &bh);
-        display.setCursor((barW - (int)bw) / 2 - bx, top + i * (capH + gap) + capH);
-        display.print(c);
-    }
-    display.setTextColor(INK);
-}
+// Screen grid, shared by every screen (keep in sync with tools/weather_design.py).
+// Content fills x=MARGIN..W-MARGIN and y=CONTENT_TOP..CONTENT_BOT; the weekday
+// letter sits on its own row below it.
+static const int MARGIN      = 8;     // left/right edge of the content
+static const int CONTENT_TOP = 9;     // top of the 84px content block
+static const int CONTENT_BOT = 93;    // bottom of the content block
+static const int DAY_BASE    = 113;   // weekday letter baseline (cap height 11, H_DAY in the tool)
 
-// Weekday bar geometry, shared by both screens.
-static const int BAR_W   = 19;   // inverted weekday bar (full height, left edge)
-static const int DAY_CAP = 11;   // weekday letter cap height (= H_DAY in the tool)
-static const int DAY_GAP = 8;    // gap between stacked weekday letters
+// Weekday of the reading as one letter on the bottom row, its position a week
+// ruler: Sunday's ink starts at the left margin, Saturday's ends at the right
+// margin, the days between evenly spaced by centre. Shows staleness at a glance
+// (dead battery). Mirrors day_x() in tools/weather_design.py.
+static void drawDay(int wd) {
+    if (wd < 0 || wd > 6) return;
+    static const char letters[] = "SMTWTFS";
+    char c[2] = {letters[wd], 0};
+    display.setFont(&WeatherDay);
+    int16_t bx, by; uint16_t bw, bh;
+    display.getTextBounds(c, 0, 0, &bx, &by, &bw, &bh);
+    int half = (int)bw / 2;
+    int first = MARGIN + half, last = display.width() - MARGIN - ((int)bw - half);
+    int left = first + (last - first) * wd / 6 - half;   // ink left edge
+    display.setCursor(left - bx, DAY_BASE);
+    display.print(c);
+}
 
 static void renderWord(const Weather& w) {
     const WordArt& a = wordArtFor(w);
@@ -492,7 +497,7 @@ static void renderWord(const Weather& w) {
     display.firstPage();
     do {
         display.fillScreen(PAPER);
-        drawDayBar(w.day, BAR_W, DAY_CAP, DAY_GAP);
+        drawDay(w.day);
         display.drawBitmap(x, y, a.bits, a.w, a.h, INK);
     } while (display.nextPage());
     drawDone(w.night && NIGHT_INVERT ? "word-night" : "word");
@@ -500,7 +505,7 @@ static void renderWord(const Weather& w) {
 
 // Night screen: a small "Tomorrow" over the next day's low-high in the big
 // current-temp font (the Hi/Lo font when a 3-digit temp makes that too wide),
-// both centred in the box right of the bar. Mirrors tmrw_layout() in
+// both centred in the content box, tomorrow's weekday on the bottom row. Mirrors tmrw_layout() in
 // tools/weather_design.py.
 static void renderTomorrow(const Weather& w) {
     const int H_LABEL = 17, H_BIG = 57, H_HL = 37;   // font heights (H_COND/H_BIG/H_HL in the tool)
@@ -516,7 +521,7 @@ static void renderTomorrow(const Weather& w) {
     display.getTextBounds(range, 0, 0, &bx, &by, &bw, &bh);
     bool big = (int)bw <= BOX_W;
     int h = big ? H_BIG : H_HL;
-    int labelBase = (display.height() - (H_LABEL + GAP + h)) / 2 + H_LABEL;
+    int labelBase = CONTENT_TOP + (CONTENT_BOT - CONTENT_TOP - (H_LABEL + GAP + h)) / 2 + H_LABEL;
     int rangeBase = labelBase + GAP + h;
 
     display.setTextColor(INK);
@@ -525,7 +530,7 @@ static void renderTomorrow(const Weather& w) {
     display.firstPage();
     do {
         display.fillScreen(PAPER);
-        drawDayBar(w.tmrwDay, BAR_W, DAY_CAP, DAY_GAP);
+        drawDay(w.tmrwDay);
         display.setFont(&WeatherCond);
         display.getTextBounds("Tomorrow", 0, 0, &bx, &by, &bw, &bh);
         display.setCursor(WORD_BOX_X0 + (BOX_W - (int)bw) / 2 - bx, labelBase);
@@ -541,14 +546,13 @@ static void renderTomorrow(const Weather& w) {
 static void renderWeather(const Weather& w) {
     int W = display.width();
     // ---- LAYOUT KNOBS (keep in sync with tools/weather_design.py) ----
-    // Sized so the worst case (3-digit Hi next to a 3-digit current temp) keeps
-    // 8px between them. Both columns are 84px tall and centred (y=19..103).
-    const int LEFT_X    = BAR_W + 8;    // Hi/Lo are left-aligned to here
-    const int RIGHT_X   = W - 8;        // current temp + condition are right-aligned to here
-    const int HI_BASE   = 56;           // High baseline (top aligned with the big temp's top)
-    const int LO_BASE   = 103;          // Low baseline  (aligned with the condition baseline)
-    const int CUR_BASE  = 76;           // big current temp baseline (right; top level with Hi)
-    const int COND_BASE = 103;          // condition word baseline (right)
+    // Both columns are 84px tall and fill the content block (y=9..93).
+    const int LEFT_X    = MARGIN;       // Hi/Lo are left-aligned to here
+    const int RIGHT_X   = W - MARGIN;   // current temp + condition are right-aligned to here
+    const int HI_BASE   = 46;           // High baseline (top aligned with the big temp's top)
+    const int LO_BASE   = CONTENT_BOT;  // Low baseline  (aligned with the condition baseline)
+    const int CUR_BASE  = 66;           // big current temp baseline (right; top level with Hi)
+    const int COND_BASE = CONTENT_BOT;  // condition word baseline (right)
 
     display.setTextColor(INK);
     display.setFullWindow();
@@ -559,7 +563,7 @@ static void renderWeather(const Weather& w) {
         int16_t bx, by; uint16_t bw, bh;
 
         // ---- weekday of this reading, so a stale screen (dead battery) is obvious ----
-        drawDayBar(w.day, BAR_W, DAY_CAP, DAY_GAP);
+        drawDay(w.day);
 
         // ---- LEFT: High over Low, left-aligned ----
         display.setFont(&WeatherHL);
@@ -667,9 +671,9 @@ static void cacheStore(const Weather& w) {
     rtc.cache.temp = w.temp; rtc.cache.hi = w.hi; rtc.cache.lo = w.lo;
     rtc.cache.code = w.code; rtc.cache.precipPct6h = w.precipPct6h; rtc.cache.snow6h = w.snow6h;
     rtc.cache.night = w.night;
-    strlcpy(rtc.cache.day, w.day.c_str(), sizeof(rtc.cache.day));
+    rtc.cache.day = w.day;
     rtc.cache.tmrwHi = w.tmrwHi; rtc.cache.tmrwLo = w.tmrwLo;
-    strlcpy(rtc.cache.tmrwDay, w.tmrwDay.c_str(), sizeof(rtc.cache.tmrwDay));
+    rtc.cache.tmrwDay = w.tmrwDay;
 }
 
 static Weather cacheLoad() {
@@ -915,8 +919,8 @@ void setup() {
     w.city = city;
     Serial.printf("Temp %.1f  Hi %.1f  Lo %.1f  code %d  precip6h %d%%%s  @ %s %s %s\n",
                   w.temp, w.hi, w.lo, w.code, w.precipPct6h, w.snow6h ? " (snow)" : "",
-                  w.day.c_str(), w.updated.c_str(), w.night ? "night" : "day");
-    Serial.printf("Tomorrow %s  Lo %.1f  Hi %.1f\n", w.tmrwDay.c_str(), w.tmrwLo, w.tmrwHi);
+                  weekdayName(w.day), w.updated.c_str(), w.night ? "night" : "day");
+    Serial.printf("Tomorrow %s  Lo %.1f  Hi %.1f\n", weekdayName(w.tmrwDay), w.tmrwLo, w.tmrwHi);
 
     bootlog::stage("weather");
     cacheStore(w);

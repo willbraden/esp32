@@ -23,5 +23,5 @@ Only when something is wrong: router down, no internet, or an API outage.
 
 ## Gotchas
 
-- Status screens don't have the weekday bar or the cached reading. A failed fetch replaces a good screen with an error rather than keeping the old data. Possible improvement: on failure, redraw from the RTC cache if it's recent.
+- Status screens don't have the weekday letter or the cached reading. A failed fetch replaces a good screen with an error rather than keeping the old data. Possible improvement: on failure, redraw from the RTC cache if it's recent.
 - "Will retry shortly" actually means the next 30-minute wake.

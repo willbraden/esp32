@@ -33,53 +33,58 @@ FONT_MAIN = "tools/fonts/JetBrainsMono-Bold.ttf"
 FONT_BIG  = FONT_MAIN  # big current temp
 FONT_HL   = FONT_MAIN  # Hi / Lo
 FONT_COND = FONT_MAIN  # condition word
-FONT_DAY  = FONT_MAIN  # weekday letters in the bar
+FONT_DAY  = FONT_MAIN  # weekday letter on the bottom row
 
 # Glyph height in pixels for each element (bigger = bigger text).
-# Sized so the WORST case below keeps >= 8px between neighbours (width-bound:
-# a 3-digit Hi next to a 3-digit current temp is exactly 8px apart; JetBrains
-# Mono's digits are wider than Arial's, so the big temp dropped from 59 to 57).
+# Sized so the WORST case below keeps >= 8px between neighbours (a 3-digit Hi
+# next to a 3-digit current temp; JetBrains Mono's digits are wider than Arial's).
 H_BIG  = 57   # current temp
 H_HL   = 37   # Hi / Lo
 H_COND = 17   # condition word
 H_DAY  = 11   # weekday letters (cap height)
 
-# Layout positions (must match the LAYOUT KNOBS in weather_main.cpp).
+# Screen grid (must match the constants above drawDay() in weather_main.cpp).
 # Screen is 250 wide x 122 tall. y values are text BASELINES.
-# Both columns are 84px tall and centred: tops at y=19, bottoms at y=103.
-BAR_W     = 19       # inverted weekday bar on the left edge (full height)
-DAY_GAP   = 8        # vertical gap between stacked weekday letters
-LEFT_X    = BAR_W + 8  # Hi/Lo left edge
-RIGHT_X   = 250 - 8  # right edge that the temp + condition align to
-HI_BASE   = 56       # Hi baseline   (top aligned with the big temp's top)
-LO_BASE   = 103      # Lo baseline   (aligned with the condition baseline)
-CUR_BASE  = 76       # current-temp baseline (top = 76 - 57 = 19, level with Hi)
-COND_BASE = 103      # condition baseline
+# Content fills x=8..242, y=9..93; the weekday letter has its own row below
+# (y=102..113), sliding along it like a week ruler: S at the left margin,
+# S at the right margin, M T W T F evenly spaced between.
+MARGIN      = 8
+CONTENT_TOP = 9
+CONTENT_BOT = 93
+DAY_BASE    = 113      # weekday letter baseline (9px gap above, 9px margin below)
+
+# Numbers screen (must match the LAYOUT KNOBS in renderWeather()).
+# Both columns are 84px tall and fill the content block.
+LEFT_X    = MARGIN        # Hi/Lo left edge
+RIGHT_X   = 250 - MARGIN  # right edge that the temp + condition align to
+HI_BASE   = 46            # Hi baseline   (top aligned with the big temp's top)
+LO_BASE   = CONTENT_BOT   # Lo baseline   (aligned with the condition baseline)
+CUR_BASE  = 66            # current-temp baseline (top = 66 - 57 = 9, level with Hi)
+COND_BASE = CONTENT_BOT   # condition baseline
 
 # ---- tomorrow screen (replaces both screens between sunset and sunrise) ----
 # A small "Tomorrow" (condition font) over tomorrow's low-high range in the big
 # current-temp font, or the Hi/Lo font when that is too wide (3-digit temps).
-# Both centred in the box right of the bar, the pair centred vertically.
+# Both centred in the content block, the pair centred vertically.
 # Must match renderTomorrow().
-TMRW_GAP = 10           # label bottom -> range top. With the big font: y=19..103
+TMRW_GAP = 10           # label bottom -> range top. With the big font: y=9..93
 PREVIEW_TMRW_PNG = "tools/preview_tomorrow.png"
 
 # ---- word mode (USER SW toggles between the numbers screen and this) ----
 # Each word is rendered as its own bitmap, scaled to the largest size that fits
-# the box right of the bar (so short words like HOT come out bigger than CHILLY).
+# the content block (so short words like HOT come out bigger than CHILLY).
 FONT_WORD  = FONT_MAIN
-WORD_BOX   = (BAR_W + 8, 8, 250 - 8, 122 - 8)   # x0, y0, x1, y1 (8px margins)
+WORD_BOX   = (MARGIN, CONTENT_TOP, 250 - MARGIN, CONTENT_BOT)   # x0, y0, x1, y1
 WORDS      = ["SNOW", "RAIN", "FREEZE", "COLD", "CHILLY", "HOT", "HELL"]
 SHADES_W   = 190      # sunglasses icon width (height follows its 2.5:1 shape)
 WORDS_HEADER = "src/weather/weather_words.h"
 WORDS_PNG    = "tools/preview_words.png"
 
 # What to show in the preview (change to test different values / longest words).
-PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day="MON",
-               tmrw=["46-63", "98-102"], tmrw_day="TUE")
+PREVIEW = dict(hi="103", lo="74", cur="102", cond="Clear", day=1,      # 0=Sun..6=Sat
+               tmrw=["46-63", "98-102"], tmrw_day=2)
 # Worst cases checked for collisions on every run.
 WORST = dict(nums=["108", "-18"], conds=["Cloudy", "Storm", "Clear", "Rain", "Snow", "Fog"],
-             days=["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
              ranges=["108-112", "98-102", "-18/-5", "-5/12", "99-99"])
 # ========================================================================
 
@@ -172,20 +177,24 @@ def blit(draw, f, s, penx, baseline, fill=0):
         penx += g['xadv']
 
 
-def day_layout(day, f):
-    """(penx, baseline) per letter: each centred in the bar, stack centred vertically.
-    Mirrors drawDayBar() in weather_main.cpp."""
-    total = len(day) * H_DAY + (len(day) - 1) * DAY_GAP
-    top = (122 - total) // 2
-    out = []
-    for i, c in enumerate(day):
-        g = f['glyphs'][ord(c) - FIRST]
-        out.append(((BAR_W - g['w']) // 2 - g['xoff'], top + i * (H_DAY + DAY_GAP) + H_DAY))
-    return out
+DAY_LETTERS = "SMTWTFS"
+
+
+def day_x(f, wd):
+    """Pen x of weekday wd's letter (0=Sun..6=Sat) - mirrors drawDay() in weather_main.cpp:
+    Sunday's ink starts at the left margin, Saturday's ends at the right, centres evenly spaced."""
+    ix, w = ink(f, DAY_LETTERS[wd])
+    half = w // 2
+    first, last = MARGIN + half, 250 - MARGIN - (w - half)
+    return first + (last - first) * wd // 6 - half - ix
+
+
+def draw_day(draw, f, wd):
+    blit(draw, f, DAY_LETTERS[wd], day_x(f, wd), DAY_BASE)
 
 
 def centre_pen(f, s):
-    """Pen x that centres the ink in the box right of the bar (mirrors renderTomorrow())."""
+    """Pen x that centres the ink in the content block (mirrors renderTomorrow())."""
     x0, _, x1, _ = WORD_BOX
     ix, w = ink(f, s)
     return x0 + (x1 - x0 - w) // 2 - ix
@@ -195,7 +204,7 @@ def tmrw_layout(big, hl, rng):
     """(range font, its height, label baseline, range baseline) - mirrors renderTomorrow()."""
     x0, _, x1, _ = WORD_BOX
     f, h = (big, H_BIG) if ink(big, rng)[1] <= x1 - x0 else (hl, H_HL)
-    top = (122 - (H_COND + TMRW_GAP + h)) // 2
+    top = CONTENT_TOP + (CONTENT_BOT - CONTENT_TOP - (H_COND + TMRW_GAP + h)) // 2
     return f, h, top + H_COND, top + H_COND + TMRW_GAP + h
 
 
@@ -204,11 +213,14 @@ def check(big, hl, cond, day):
     hlRight = max(LEFT_X + sum(ink(hl, n)) for n in WORST['nums'])      # ink right edge
     bigLeft = min(right_pen(big, n) + ink(big, n)[0] for n in WORST['nums'])
     cndLeft = min(right_pen(cond, c) + ink(cond, c)[0] for c in WORST['conds'])
-    wDay = max(day['glyphs'][ord(c) - FIRST]['w'] for d in WORST['days'] for c in d)
     print(f"worst gaps: Hi->big {bigLeft - hlRight}px, "
           f"Lo->cond {cndLeft - hlRight}px, "
           f"Hi->Lo {LO_BASE - H_HL - HI_BASE}px, big->cond {COND_BASE - H_COND - CUR_BASE}px, "
-          f"day letter margin {(BAR_W - wDay) / 2:.1f}px")
+          f"content->day {DAY_BASE - H_DAY - CONTENT_BOT}px, day->bottom {121 - DAY_BASE}px")
+    for wd in range(7):
+        x1, w = ink(day, DAY_LETTERS[wd])
+        l = day_x(day, wd) + x1
+        assert MARGIN <= l and l + w <= 250 - MARGIN, f"day {wd} outside the margins"
     x0, _, x1, _ = WORD_BOX
     for r in WORST['ranges']:
         f, h, _, _ = tmrw_layout(big, hl, r)
@@ -339,9 +351,7 @@ def main():
     check(big, hl, cond, day)
 
     img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)   # e-ink gray
-    d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
-    for c, (x, y) in zip(PREVIEW['day'], day_layout(PREVIEW['day'], day)):
-        blit(d, day, c, x, y, fill=236)
+    draw_day(d, day, PREVIEW['day'])
     blit(d, hl,   PREVIEW['hi'], LEFT_X, HI_BASE)
     blit(d, hl,   PREVIEW['lo'], LEFT_X, LO_BASE)
     blit(d, big,  PREVIEW['cur'],  right_pen(big,  PREVIEW['cur']),  CUR_BASE)
@@ -357,9 +367,7 @@ def main():
     sheet = Image.new("L", (1000, len(rngs) * 498), 255)
     for i, r in enumerate(rngs):
         img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)
-        d.rectangle((0, 0, BAR_W - 1, 121), fill=0)
-        for c, (x, y) in zip(PREVIEW['tmrw_day'], day_layout(PREVIEW['tmrw_day'], day)):
-            blit(d, day, c, x, y, fill=236)
+        draw_day(d, day, PREVIEW['tmrw_day'])
         f, _, lb, rb = tmrw_layout(big, hl, r)
         blit(d, cond, "Tomorrow", centre_pen(cond, "Tomorrow"), lb)
         blit(d, f, r, centre_pen(f, r), rb)
@@ -375,9 +383,7 @@ def main():
     sheet = Image.new("L", (1010, len(names) * 254), 255)
     for i, n in enumerate(names):
         scr = Image.new("L", (250, 122), 236); sd = ImageDraw.Draw(scr)
-        sd.rectangle((0, 0, BAR_W - 1, 121), fill=0)
-        for c, (x, y) in zip(PREVIEW['day'], day_layout(PREVIEW['day'], day)):
-            blit(sd, day, c, x, y, fill=236)
+        draw_day(sd, day, PREVIEW['day'])
         paste_art(scr, arts[n])
         sheet.paste(scr.resize((500, 244), Image.NEAREST), (0, i * 254))
         sheet.paste(night(scr).resize((500, 244), Image.NEAREST), (510, i * 254))
