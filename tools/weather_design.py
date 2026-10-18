@@ -33,7 +33,6 @@ FONT_MAIN = "tools/fonts/JetBrainsMono-Bold.ttf"
 FONT_BIG  = FONT_MAIN  # big current temp
 FONT_HL   = FONT_MAIN  # Hi / Lo
 FONT_COND = FONT_MAIN  # condition word
-FONT_DAY  = FONT_MAIN  # weekday letter on the bottom row
 
 # Glyph height in pixels for each element (bigger = bigger text).
 # Sized so the WORST case below keeps >= 8px between neighbours (a 3-digit Hi
@@ -41,25 +40,39 @@ FONT_DAY  = FONT_MAIN  # weekday letter on the bottom row
 H_BIG  = 57   # current temp
 H_HL   = 37   # Hi / Lo
 H_COND = 17   # condition word
-H_DAY  = 11   # weekday letters (cap height)
 
 # Screen grid (must match the constants above drawDay() in weather_main.cpp).
 # Screen is 250 wide x 122 tall. y values are text BASELINES.
-# Content fills x=8..242, y=9..93; the weekday letter has its own row below
-# (y=102..113), sliding along it like a week ruler: S at the left margin,
-# S at the right margin, M T W T F evenly spaced between.
+# Content fills x=8..242, y=6..90; the weekday letter has its own row below
+# (y=96..115), sliding along it like a week ruler: S at the left margin,
+# S at the right margin, M T W T F evenly spaced between. 6px above the
+# content, between it and the letter, and below the letter.
 MARGIN      = 8
-CONTENT_TOP = 9
-CONTENT_BOT = 93
-DAY_BASE    = 113      # weekday letter baseline (9px gap above, 9px margin below)
+CONTENT_TOP = 6
+CONTENT_BOT = 90
+DAY_TOP     = 96
+
+# Weekday letters: the blocky glyphs from Figma ("Component 19", node 1297:15813,
+# file qoi55sJne29YRGgYxpUSd3). Each is 32x20, a 5x5 grid of 6.4 x 4 px cells,
+# rounded here to column widths 6,7,6,7,6. Drawn as filled cells, not a font.
+DAY_COL_X = [0, 6, 13, 19, 26, 32]     # column edges; glyph width = DAY_COL_X[-1]
+DAY_ROW_H = 4                          # glyph height = 5 * DAY_ROW_H = 20
+DAY_GLYPHS = {
+    "S": ["#####", "#....", "#####", "....#", "#####"],
+    "M": ["#####", "#.#.#", "#.#.#", "#.#.#", "#.#.#"],
+    "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
+    "W": ["#.#.#", "#.#.#", "#.#.#", "#.#.#", "#####"],
+    "F": ["#####", "#....", "#####", "#....", "#...."],
+}
+DAYS_HEADER = "src/weather/weather_days.h"
 
 # Numbers screen (must match the LAYOUT KNOBS in renderWeather()).
 # Both columns are 84px tall and fill the content block.
 LEFT_X    = MARGIN        # Hi/Lo left edge
 RIGHT_X   = 250 - MARGIN  # right edge that the temp + condition align to
-HI_BASE   = 46            # Hi baseline   (top aligned with the big temp's top)
+HI_BASE   = CONTENT_TOP + H_HL    # Hi baseline (top aligned with the big temp's top)
 LO_BASE   = CONTENT_BOT   # Lo baseline   (aligned with the condition baseline)
-CUR_BASE  = 66            # current-temp baseline (top = 66 - 57 = 9, level with Hi)
+CUR_BASE  = CONTENT_TOP + H_BIG   # current-temp baseline (top level with Hi)
 COND_BASE = CONTENT_BOT   # condition baseline
 
 # ---- tomorrow screen (replaces both screens between sunset and sunrise) ----
@@ -67,7 +80,7 @@ COND_BASE = CONTENT_BOT   # condition baseline
 # current-temp font, or the Hi/Lo font when that is too wide (3-digit temps).
 # Both centred in the content block, the pair centred vertically.
 # Must match renderTomorrow().
-TMRW_GAP = 10           # label bottom -> range top. With the big font: y=9..93
+TMRW_GAP = 10           # label bottom -> range top. With the big font: y=6..90
 PREVIEW_TMRW_PNG = "tools/preview_tomorrow.png"
 
 # ---- word mode (USER SW toggles between the numbers screen and this) ----
@@ -90,7 +103,7 @@ WORST = dict(nums=["108", "-18"], conds=["Cloudy", "Storm", "Clear", "Rain", "Sn
 
 DPI = 141                       # matches Adafruit fontconvert
 FIRST, LAST = 0x20, 0x7E        # printable ASCII
-STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond", day="WeatherDay")
+STRUCTS = dict(big="WeatherBig", hl="WeatherHL", cond="WeatherCond")
 HEADER  = "src/weather/weather_fonts.h"
 PREVIEW_PNG = "tools/preview.png"
 PREVIEW_NIGHT_PNG = "tools/preview_night.png"
@@ -180,17 +193,40 @@ def blit(draw, f, s, penx, baseline, fill=0):
 DAY_LETTERS = "SMTWTFS"
 
 
-def day_x(f, wd):
-    """Pen x of weekday wd's letter (0=Sun..6=Sat) - mirrors drawDay() in weather_main.cpp:
-    Sunday's ink starts at the left margin, Saturday's ends at the right, centres evenly spaced."""
-    ix, w = ink(f, DAY_LETTERS[wd])
-    half = w // 2
-    first, last = MARGIN + half, 250 - MARGIN - (w - half)
-    return first + (last - first) * wd // 6 - half - ix
+DAY_W, DAY_H = DAY_COL_X[-1], 5 * DAY_ROW_H
 
 
-def draw_day(draw, f, wd):
-    blit(draw, f, DAY_LETTERS[wd], day_x(f, wd), DAY_BASE)
+def day_x(wd):
+    """Left edge of weekday wd's letter (0=Sun..6=Sat) - mirrors drawDay() in weather_main.cpp:
+    Sunday at the left margin, Saturday ending at the right margin, evenly spaced."""
+    return MARGIN + (250 - 2 * MARGIN - DAY_W) * wd // 6
+
+
+def draw_day(draw, wd, fill=0):
+    x0 = day_x(wd)
+    for r, row in enumerate(DAY_GLYPHS[DAY_LETTERS[wd]]):
+        for c, on in enumerate(row):
+            if on == "#":
+                draw.rectangle((x0 + DAY_COL_X[c], DAY_TOP + r * DAY_ROW_H,
+                                x0 + DAY_COL_X[c + 1] - 1, DAY_TOP + (r + 1) * DAY_ROW_H - 1), fill=fill)
+
+
+def build_days():
+    """Write DAYS_HEADER: one 5-bit mask per glyph row (bit 4 = left column)."""
+    lines = ["#pragma once", "#include <Arduino.h>", "",
+             "// Generated by tools/weather_design.py - do not edit by hand.",
+             "// Weekday letters from Figma: 5x5 grids of cells, drawn with fillRect.", "",
+             f"static const int DAY_W = {DAY_W}, DAY_H = {DAY_H}, DAY_ROW_H = {DAY_ROW_H};",
+             "static const uint8_t DAY_COL_X[6] = {" + ", ".join(map(str, DAY_COL_X)) + "};",
+             "// Rows of each weekday's letter, Sunday first.",
+             "static const uint8_t DAY_ROWS[7][5] = {"]
+    for wd, l in enumerate(DAY_LETTERS):
+        masks = [int(row.replace("#", "1").replace(".", "0"), 2) for row in DAY_GLYPHS[l]]
+        lines.append("    {" + ", ".join(f"0x{m:02X}" for m in masks) + f"}},   // {l}")
+    lines += ["};", ""]
+    with open(DAYS_HEADER, "w") as fh:
+        fh.write("\n".join(lines))
+    print(f"wrote {DAYS_HEADER}")
 
 
 def centre_pen(f, s):
@@ -208,7 +244,7 @@ def tmrw_layout(big, hl, rng):
     return f, h, top + H_COND, top + H_COND + TMRW_GAP + h
 
 
-def check(big, hl, cond, day):
+def check(big, hl, cond):
     """Print the tightest gaps for the worst-case strings."""
     hlRight = max(LEFT_X + sum(ink(hl, n)) for n in WORST['nums'])      # ink right edge
     bigLeft = min(right_pen(big, n) + ink(big, n)[0] for n in WORST['nums'])
@@ -216,11 +252,9 @@ def check(big, hl, cond, day):
     print(f"worst gaps: Hi->big {bigLeft - hlRight}px, "
           f"Lo->cond {cndLeft - hlRight}px, "
           f"Hi->Lo {LO_BASE - H_HL - HI_BASE}px, big->cond {COND_BASE - H_COND - CUR_BASE}px, "
-          f"content->day {DAY_BASE - H_DAY - CONTENT_BOT}px, day->bottom {121 - DAY_BASE}px")
-    for wd in range(7):
-        x1, w = ink(day, DAY_LETTERS[wd])
-        l = day_x(day, wd) + x1
-        assert MARGIN <= l and l + w <= 250 - MARGIN, f"day {wd} outside the margins"
+          f"top {CONTENT_TOP}px, content->day {DAY_TOP - CONTENT_BOT}px, "
+          f"day->bottom {122 - DAY_TOP - DAY_H}px")
+    assert day_x(0) == MARGIN and day_x(6) + DAY_W == 250 - MARGIN, "day ruler off the margins"
     x0, _, x1, _ = WORD_BOX
     for r in WORST['ranges']:
         f, h, _, _ = tmrw_layout(big, hl, r)
@@ -340,18 +374,17 @@ def main():
     big  = convert(FONT_BIG,  STRUCTS['big'],  H_BIG)
     hl   = convert(FONT_HL,   STRUCTS['hl'],   H_HL)
     cond = convert(FONT_COND, STRUCTS['cond'], H_COND)
-    day  = convert(FONT_DAY,  STRUCTS['day'],  H_DAY)
 
     with open(HEADER, "w") as fh:
         fh.write("#pragma once\n#include <Adafruit_GFX.h>\n\n"
-                 + emit(big) + "\n\n" + emit(hl) + "\n\n" + emit(cond) + "\n\n"
-                 + emit(day) + "\n")
+                 + emit(big) + "\n\n" + emit(hl) + "\n\n" + emit(cond) + "\n")
     print(f"wrote {HEADER}  (BIG {len(big['bitmaps'])}B, HL {len(hl['bitmaps'])}B, "
-          f"COND {len(cond['bitmaps'])}B, DAY {len(day['bitmaps'])}B)")
-    check(big, hl, cond, day)
+          f"COND {len(cond['bitmaps'])}B)")
+    check(big, hl, cond)
+    build_days()
 
     img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)   # e-ink gray
-    draw_day(d, day, PREVIEW['day'])
+    draw_day(d, PREVIEW['day'])
     blit(d, hl,   PREVIEW['hi'], LEFT_X, HI_BASE)
     blit(d, hl,   PREVIEW['lo'], LEFT_X, LO_BASE)
     blit(d, big,  PREVIEW['cur'],  right_pen(big,  PREVIEW['cur']),  CUR_BASE)
@@ -367,7 +400,7 @@ def main():
     sheet = Image.new("L", (1000, len(rngs) * 498), 255)
     for i, r in enumerate(rngs):
         img = Image.new("L", (250, 122), 236); d = ImageDraw.Draw(img)
-        draw_day(d, day, PREVIEW['tmrw_day'])
+        draw_day(d, PREVIEW['tmrw_day'])
         f, _, lb, rb = tmrw_layout(big, hl, r)
         blit(d, cond, "Tomorrow", centre_pen(cond, "Tomorrow"), lb)
         blit(d, f, r, centre_pen(f, r), rb)
@@ -383,7 +416,7 @@ def main():
     sheet = Image.new("L", (1010, len(names) * 254), 255)
     for i, n in enumerate(names):
         scr = Image.new("L", (250, 122), 236); sd = ImageDraw.Draw(scr)
-        draw_day(sd, day, PREVIEW['day'])
+        draw_day(sd, PREVIEW['day'])
         paste_art(scr, arts[n])
         sheet.paste(scr.resize((500, 244), Image.NEAREST), (0, i * 254))
         sheet.paste(night(scr).resize((500, 244), Image.NEAREST), (510, i * 254))

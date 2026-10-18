@@ -19,12 +19,12 @@ Layout knobs (`renderWeather()` and the CONFIG block in `tools/weather_design.py
 
 | Knob | Value | Rule |
 |---|---|---|
-| `HI_BASE` | 46 | Hi top lines up with the big temp's top (y = 9) |
-| `LO_BASE` | 93 | Lo baseline = condition baseline |
-| `CUR_BASE` | 66 | top at 9, level with Hi |
-| `COND_BASE` | 93 | 8 px below the big temp |
+| `HI_BASE` | 43 | Hi top lines up with the big temp's top (y = 6) |
+| `LO_BASE` | 90 | Lo baseline = condition baseline |
+| `CUR_BASE` | 63 | top at 6, level with Hi |
+| `COND_BASE` | 90 | 8 px below the big temp |
 
-Both columns are 84 px tall and fill the content block (y = 9…93), full width (x = 8…242); the weekday letter has its own row below. The worst case (3-digit Hi beside a 3-digit current temp, e.g. 108 / 102) leaves 27 px. The tool prints `worst gaps: Hi->big 27px ...` on every run; any value under 8 is a regression.
+Both columns are 84 px tall and fill the content block (y = 6…90), full width (x = 8…242); the weekday letter has its own row below. The worst case (3-digit Hi beside a 3-digit current temp, e.g. 108 / 102) leaves 27 px. The tool prints `worst gaps: Hi->big 27px ...` on every run; any value under 8 is a regression.
 
 Proof for a layout change: tool output + `tools/preview.png` + a panel photo. For data: the `Temp ...` serial line matches what's drawn.
 

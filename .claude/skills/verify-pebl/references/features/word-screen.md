@@ -33,7 +33,7 @@ Press USER SW from the numbers screen. The choice is remembered through sleep, R
 
 - Every word: `tools/preview_words.png` (all eight screens, rendered from the same bitmaps the firmware draws). That covers words you can't produce on demand (HELL, SNOW).
 - On device: switch to mode 1, then check that the word on the panel matches the rules applied to the `Temp ... precip6h` line.
-- Art lives in `src/weather/weather_words.h`, generated. Sizes as of 2026-10-18 (JetBrains Mono Bold): SNOW 233×75, RAIN 233×76, FREEZE 230×50, COLD 234×78, CHILLY 234×52, HOT 187×84, HELL 232×74, SHADES 190×76. Box is the content block, x 8–242, y 9–93.
+- Art lives in `src/weather/weather_words.h`, generated. Sizes as of 2026-10-18 (JetBrains Mono Bold): SNOW 233×75, RAIN 233×76, FREEZE 230×50, COLD 234×78, CHILLY 234×52, HOT 187×84, HELL 232×74, SHADES 190×76. Box is the content block, x 8–242, y 6–90.
 
 ## Gotchas
 

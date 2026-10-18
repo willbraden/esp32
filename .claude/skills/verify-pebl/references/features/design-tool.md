@@ -4,10 +4,10 @@
 
 ## Sub-features
 
-- font-convert: TTF → Adafruit GFX headers (`WeatherBig`, `WeatherHL`, `WeatherCond`, `WeatherDay`) in `src/weather/weather_fonts.h`. A Python port of fontconvert (DPI 141, `yOffset = 1 - bitmap_top`, MSB bit packing)
+- font-convert: TTF → Adafruit GFX headers (`WeatherBig`, `WeatherHL`, `WeatherCond`) in `src/weather/weather_fonts.h`; the weekday glyphs (pixel grids, not a font) go to `src/weather/weather_days.h`. A Python port of fontconvert (DPI 141, `yOffset = 1 - bitmap_top`, MSB bit packing)
 - word-art: each word plus the sunglasses → `src/weather/weather_words.h` (Adafruit `drawBitmap` format)
 - previews: `tools/preview.png` and `tools/preview_night.png` (numbers screen, day and night, 4× scale) and `tools/preview_words.png` (all eight word screens, day left, night right) and `tools/preview_tomorrow.png` (the night tomorrow screen, big-font and fallback ranges)
-- gap-check: prints worst-case gaps (Hi→big, Lo→condition, Hi→Lo, big→condition, weekday letter margin), then the tomorrow range font and width for each worst-case range. It fails if one overflows the box
+- gap-check: prints worst-case gaps (Hi→big, Lo→condition, Hi→Lo, big→condition, top margin, content→weekday letter, letter→bottom), then the tomorrow range font and width for each worst-case range. It fails if one overflows the box
 - ink alignment: `ink()` / `right_pen()` mirror Adafruit `getTextBounds`, so right-aligned text matches the device
 
 ## How to get to it (user POV)
