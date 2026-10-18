@@ -33,13 +33,15 @@ This is what earlier notes called "the board wedges after a software reboot". **
 
 Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
-### RESOLVED: panel stays white while every refresh runs normally (2026-10-18)
+### OPEN: panel FPC loses contact, so the glass goes white and stops responding (2026-10-18)
 
-After four good USB-powered button flips on v1.3.1 (#358–361), a RESET (#362) left the panel **pure white**, and it has stayed white since. That's eight full refreshes across v1.3.1 and v1.4.1, all on USB (`usb=host`), every one holding BUSY a normal ~2270–2290 ms. Reflashing v1.3.1 over USB (#365: weather, then "Updating firmware...") showed nothing either. So it isn't the firmware and it isn't the battery.
+Twice on 2026-10-18 the panel went white and stayed white, while every refresh logged a normal BUSY (~2270–2290 ms, `_Update_Full`) on USB and on battery, across v1.3.1, v1.4.1 and v1.4.2. Reseating the FPC fixed it both times. Neither a chip reset nor a 10 s power-switch cycle did.
 
-The controller accepts commands and runs the full waveform, but the glass ends up white. E-ink holds its last image with no power, so a dead link would have left the old weather on screen. Something drove it to white. That points to a partial drive failure: one of the panel's drive voltages (from the boost circuit, carried over the FPC) is missing. Suspects: the FPC seated badly in its connector or cracked, then the boost parts. The board can't read the SSD1680's HV-ready status because MISO isn't wired. The blank first draw after the v1.1.1 OTA (below) may have been an early sign of the same intermittent fault.
+Decisive check: watch the panel during a refresh. A driven panel visibly flashes black and white for ~2 s. In this state **nothing moves**. The SSD1680 accepts commands and runs its waveform, but no drive voltage reaches the glass. So it isn't firmware: a bug drawing a white image would still flash. The panel went white rather than freezing on the old image, so one drive line probably failed partway through a refresh.
 
-**Cause: the panel FPC wasn't seated properly.** Power off, reseat, power on: the next boot drew v1.4.1's weather with the bottom-row weekday letter. If the panel goes white but `draw=` still shows ~2300 ms, reseat the FPC before suspecting firmware.
+Both times it broke right after an OTA install from GitHub (#362→#363 for v1.4.1, #381→#382 for v1.4.2), as did the v1.1.1 blank below. USB flashes and normal wakes in between drew fine. Possibly the long Wi-Fi download warms the board enough to shift a marginal contact, or it's coincidence. Either way the fault is the connection, and the fix is mechanical: seat the FPC with the latch fully opened and closed, and hold it (tape or foam over the connector) or replace the connector or panel if it keeps happening.
+
+How to recognise it: panel white, the boot log shows `draw=...:~2280ms`, and the panel doesn't flash while the board refreshes. Reseat before debugging firmware.
 
 ### WATCHING: blank panel after the first draw of an OTA update
 
