@@ -37,7 +37,7 @@ $PY tools/weather_design.py                                # regenerate fonts/wo
 ## Command surface
 
 - **Build/flash:** `pio run -e <env> [-t upload --upload-port <port>]`. Envs: `pebl_weather` (the product), `pebl_weather_staging` (1-minute wakes, local OTA server), `pebl_weather_fault` (staging plus forced Wi-Fi failures on OTA trial boots, for proving retry and rollback; never ship it), `pebl_battprobe`, `pebl_btnprobe`, `pebl_netstress`, `pebl_otafail` (diagnostics). Each env compiles only its own `src/` folder (`build_src_filter`); give any new env one too.
-- **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote. Full procedure in [Ship an update](#ship-an-update).
+- **Release (OTA):** an annotated `weather-vX.Y.Z` tag pushed to the `willbraden` remote, or a hand run of the `weather-release` workflow on `main` with the version (it makes the tag). Full procedure in [Ship an update](#ship-an-update).
 - **Unit tests:** `clang++ -std=c++17 -I src/weather tools/test_semver.cpp -o /tmp/t && /tmp/t`.
 - **Leave download mode:** `esptool.py --chip esp32s3 --port <port> --after watchdog_reset chip_id`. A plain `--after hard_reset` leaves this chip in download mode.
 - **Serial:** `tools/serial_log.py [--until TEXT] [--timeout S] [--quiet] [--port P]`. It reconnects across deep sleep and opens with DTR/RTS deasserted. `--timeout` counts from launch, not from the boot: give it room when waiting for the user.
@@ -58,6 +58,7 @@ Devices update themselves from GitHub releases (design in [`ota-updates.md`](ref
    git tag -a weather-v1.0.1 -m "pebl weather 1.0.1: <one-line summary>"
    git push willbraden weather-v1.0.1
    ```
+   **From a cloud session** (its GitHub connection drops tag pushes: git prints `Everything up-to-date` and no tag appears): push `main`, then run the workflow on `main` with the version instead of tagging. With the GitHub tools that is `actions_run_trigger` `run_workflow`, `workflow_id: weather-release.yml`, `ref: main`, `inputs: {"version": "1.0.1"}`. The run refuses a version that already exists or isn't newer than the latest release, then builds, signs and verifies, and only then creates the tag on that commit. A failed run leaves no tag behind.
 5. **Watch the pipeline** (about 4 minutes): build, unit tests, sign, self-verify, publish, update the channel manifest. If `gh` isn't allowed in the session, skip to step 6 and poll the channel manifest until it shows the new version.
    ```bash
    gh run list --repo willbraden/esp32 --workflow weather-release.yml --limit 1

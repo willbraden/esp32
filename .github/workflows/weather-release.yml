@@ -1,7 +1,12 @@
 # Build, sign and publish an over-the-air update for the pebl weather firmware.
 #
-# Trigger: push a tag like weather-v1.2.0 (or weather-v1.3.0-rc.1 for staging only).
-#   git tag weather-v1.2.0 && git push willbraden weather-v1.2.0
+# Trigger, either:
+#   * push a tag like weather-v1.2.0 (or weather-v1.3.0-rc.1 for staging only):
+#       git tag -a weather-v1.2.0 -m "..." && git push willbraden weather-v1.2.0
+#   * or run it by hand on main (Actions > weather-release > Run workflow, or the
+#     API) with a version like 1.2.0. It refuses a version that isn't newer than
+#     the latest weather-v* tag, builds, signs and verifies, and only then creates
+#     the tag on main's commit. For pushers that can't push tags (cloud sessions).
 #
 # Output:
 #   * release weather-v1.2.0 with pebl-weather-1.2.0.bin + manifest.json
@@ -16,6 +21,12 @@ name: weather-release
 on:
   push:
     tags: ["weather-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release from main, e.g. 1.3.2 or 1.4.0-rc.1 (staging only)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -34,13 +45,50 @@ jobs:
 
       - name: Version and channels from the tag
         id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#weather-v}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            # A hand-run release ships main, nothing else.
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::run this workflow on main, not $GITHUB_REF_NAME"; exit 1
+            fi
+            VERSION="${INPUT_VERSION#v}"; TAG="weather-v$VERSION"
+          else
+            TAG="${GITHUB_REF_NAME}"; VERSION="${TAG#weather-v}"
+          fi
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
             echo "::error::tag $TAG is not weather-vMAJOR.MINOR.PATCH[-pre]"; exit 1
           fi
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            # Published tags are never reused, and devices never downgrade, so
+            # the new version must be above the existing weather-v* tags.
+            git fetch --force --tags origin
+            if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+              echo "::error::$TAG already exists"; exit 1
+            fi
+            python3 - "$VERSION" $(git tag -l 'weather-v*' | sed 's/^weather-v//') <<'PY'
+          import re, sys
+          def key(v):
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?", v)
+              if not m: return None
+              core = tuple(int(x) for x in m.group(1, 2, 3))
+              pre = m.group(4)
+              # semver precedence: a release outranks its prereleases; numeric ids compare as numbers
+              ids = [] if pre is None else [(0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split(".")]
+              return (core, pre is None, ids)
+          new, old = sys.argv[1], [v for v in sys.argv[2:] if key(v)]
+          # A release only has to beat earlier releases: stable devices never saw
+          # the -rc ones, so an open 1.4.0-rc.1 mustn't block a 1.3.2 hotfix.
+          if key(new)[1]: old = [v for v in old if key(v)[1]]
+          top = max(old, key=key, default=None)
+          if top and key(new) <= key(top):
+              sys.exit(f"::error::{new} is not newer than the latest release {top}")
+          print(f"{new} > {top}")
+          PY
+          fi
           if [[ "$VERSION" == *-* ]]; then CHANNELS="staging"; PRE="--prerelease"; else CHANNELS="stable staging"; PRE=""; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "channels=$CHANNELS" >> "$GITHUB_OUTPUT"
           echo "pre=$PRE" >> "$GITHUB_OUTPUT"
@@ -73,11 +121,12 @@ jobs:
         env:
           PEBL_OTA_SIGNING_KEY: ${{ secrets.PEBL_OTA_SIGNING_KEY }}
           VERSION: ${{ steps.v.outputs.version }}
+          TAG: ${{ steps.v.outputs.tag }}
         run: |
           cp .pio/build/pebl_weather/firmware.bin "pebl-weather-$VERSION.bin"
           python tools/ota_sign.py sign \
             --firmware "pebl-weather-$VERSION.bin" --version "$VERSION" \
-            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/pebl-weather-$VERSION.bin" \
+            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/pebl-weather-$VERSION.bin" \
             --key-env PEBL_OTA_SIGNING_KEY --out manifest.json
 
       - name: Verify against the public key the devices carry
@@ -85,14 +134,28 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: python tools/ota_sign.py verify --firmware "pebl-weather-$VERSION.bin" --manifest manifest.json --pubkey-header src/weather/ota_pubkey.h
 
+      # Only now, with a signed and verified build, so a failed run leaves no tag.
+      # A tag pushed with the workflow token doesn't start another run.
+      - name: Create the tag (hand-run releases)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "pebl weather $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+
       - name: Publish release and update channels
         env:
+          TAG: ${{ steps.v.outputs.tag }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.v.outputs.version }}
           CHANNELS: ${{ steps.v.outputs.channels }}
           PRE: ${{ steps.v.outputs.pre }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "pebl-weather-$VERSION.bin" manifest.json \
+          gh release create "$TAG" --verify-tag "pebl-weather-$VERSION.bin" manifest.json \
             --title "pebl weather $VERSION" --generate-notes $PRE
           for ch in $CHANNELS; do
             if ! gh release view "weather-ota-$ch" > /dev/null 2>&1; then
