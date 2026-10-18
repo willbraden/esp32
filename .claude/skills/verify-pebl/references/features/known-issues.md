@@ -33,6 +33,14 @@ This is what earlier notes called "the board wedges after a software reboot". **
 
 Seen after crash reboots and once mid-run with no crash (netstress HTTPS-only round 10). The "serial output stops after `_Update_Full`" blackouts look like the same thing: boot log #7 proved the firmware finished normally while serial was silent. Cause unknown. In the field (battery, no USB) it doesn't matter; it only costs development time. Work with it: read results from flash (`tools/boot_log.py`) instead of trusting serial, and tap RESET to get the port back.
 
+### RESOLVED: panel stays white while every refresh runs normally (2026-10-18)
+
+After four good USB-powered button flips on v1.3.1 (#358–361), a RESET (#362) left the panel **pure white**, and it has stayed white since. That's eight full refreshes across v1.3.1 and v1.4.1, all on USB (`usb=host`), every one holding BUSY a normal ~2270–2290 ms. Reflashing v1.3.1 over USB (#365: weather, then "Updating firmware...") showed nothing either. So it isn't the firmware and it isn't the battery.
+
+The controller accepts commands and runs the full waveform, but the glass ends up white. E-ink holds its last image with no power, so a dead link would have left the old weather on screen. Something drove it to white. That points to a partial drive failure: one of the panel's drive voltages (from the boost circuit, carried over the FPC) is missing. Suspects: the FPC seated badly in its connector or cracked, then the boost parts. The board can't read the SSD1680's HV-ready status because MISO isn't wired. The blank first draw after the v1.1.1 OTA (below) may have been an early sign of the same intermittent fault.
+
+**Cause: the panel FPC wasn't seated properly.** Power off, reseat, power on: the next boot drew v1.4.1's weather with the bottom-row weekday letter. If the panel goes white but `draw=` still shows ~2300 ms, reseat the FPC before suspecting firmware.
+
 ### WATCHING: blank panel after the first draw of an OTA update
 
 `weather-v1.1.1`, 2026-10-13: the long press installed it (boot log #104 `ota=installing-1.1.1`), and its first boot (#105) fetched, drew (`path=...>drawn>ota>sleep`), checked (`ota=up-to-date`) and confirmed itself (otadata state `0x2` VALID). But the panel showed **pure white** instead of the weather. A fresh boot of the same image (watchdog reset, on USB) drew normally. The board was on battery during the update. Crash restarts earlier the same day were followed by normal draws, so a plain software restart isn't enough to cause it. What was different: a full refresh ("Updating firmware...") about 30 s before the restart, with the panel left powered, and battery power.
