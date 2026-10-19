@@ -41,7 +41,11 @@ Decisive check: watch the panel during a refresh. A driven panel visibly flashes
 
 Both times it broke right after an OTA install from GitHub (#362→#363 for v1.4.1, #381→#382 for v1.4.2), as did the v1.1.1 blank below. USB flashes and normal wakes in between drew fine. Possibly the long Wi-Fi download warms the board enough to shift a marginal contact, or it's coincidence. Either way the fault is the connection, and the fix is mechanical: seat the FPC with the latch fully opened and closed, and hold it (tape or foam over the connector) or replace the connector or panel if it keeps happening.
 
-How to recognise it: panel white, the boot log shows `draw=...:~2280ms`, and the panel doesn't flash while the board refreshes. Reseat before debugging firmware.
+Later on 2026-10-18 a reseat held for under an hour. After it, the panel froze on a 2:45 PM reading (76°) for ~4 hours while the board woke on schedule (#387–393), fetched fresh data, and logged normal refreshes. A live boot at 6:50 PM fetched 63.4° and night and drew the Tomorrow screen, but the panel went white instead. So the fault has two faces: **frozen** (the contact is fully open, so nothing reaches the glass and the old image stays) and **white** (partly open). Both look like "not updating" while the firmware does its job. This morning's stale 54° was the frozen face. Handling (plugging USB, pressing BOOT/RESET) flexes the board next to the connector and seems to trigger it.
+
+Most likely a cracked trace in the panel's FPC tail near the connector, or a worn connector. Reseating moves the crack and helps only briefly. Inspect the FPC where it bends into the connector, and replace the panel (the FPC is part of it) if it keeps coming back.
+
+How to recognise it: the panel is white or frozen on an old reading, the boot log shows wakes on schedule with `draw=...:~2280ms`, and the panel doesn't flash while the board refreshes. Don't debug firmware for this.
 
 ### WATCHING: blank panel after the first draw of an OTA update
 
